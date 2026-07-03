@@ -1023,16 +1023,15 @@ def ejecutar_ciclo():
             log.warning(f"No hay noticias disponibles en el pool de {sec['name']}.")
             continue
             
-        for _ in range(sec["limit"] * 3):  # intentar hasta 3 veces el límite por si fallan
+        total_noticias = len(pool)
+        for idx, noticia in enumerate(pool):
             if publicados_seccion >= sec["limit"]:
                 break
                 
-            noticia = elegir_noticia_nueva(pool, publicadas)
-            if not noticia:
-                log.info(f"No hay noticias nuevas sin publicar en {sec['name']}.")
-                break
+            if ya_fue_publicada(noticia["url"], publicadas):
+                continue
 
-            log.info(f"📰 [{sec['name'].upper()}] Noticia seleccionada: {noticia['titulo']}")
+            log.info(f"📰 [{sec['name'].upper()}] [{idx+1}/{total_noticias}] Noticia seleccionada: {noticia['titulo']}")
             log.info(f"   URL: {noticia['url']}")
 
             # Extraer entidad (jugador y equipo)
@@ -1124,7 +1123,7 @@ def ejecutar_ciclo():
                 articulos_publicados_en_ciclo += 1
                 if jugador:
                     registrar_cooldown(jugador, sec["name"])
-                log.info(f"✅ [{sec['name'].upper()}] Publicado: {resultado.get('link')}")
+                log.info(f"✅ [{sec['name'].upper()}] [{publicados_seccion}/{sec['limit']}] Publicado: {resultado.get('link')}")
                 
                 # Filtro de palabras sensibles (Gossip) y Telegram Alerta
                 if sec["name"] == "gossip":
