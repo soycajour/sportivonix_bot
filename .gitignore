@@ -1,0 +1,19 @@
+# Ignorar credenciales y llaves de API
+config.py
+
+# Ignorar archivos de base de datos local y estados del bot
+publicadas.json
+cooldowns.json
+
+# Ignorar logs de ejecución
+*.log
+bot_futbol.log
+
+# Ignorar carpetas temporales y caché
+__pycache__/
+imagenes_temp/
+.vscode/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
