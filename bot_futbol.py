@@ -427,8 +427,10 @@ WRITING RULES:
 2. LENGTH: {min_w}-{max_w} words.
 3. OPENING: Start with a striking, dramatic, or scandalous hook about the player's life or choices. E.g. 'Neymar has once again proven that money cannot buy discretion.'
 4. STYLE: Free-style, opinionated, and gossipy. Discuss salaries, purchases, relationships, or fan sentiment, but always include the official response/denial if present in the research.
-5. SOURCE HANDLING: {instrucciones_tier}
-6. CROSS-LINKING: Near the end, include exactly one paragraph referring to the player's professional performance, linking to their tag (e.g. '<p><em>Curious about his actual performance on the pitch? Check out our <a href="/tag/[player-name-slug]/">Transfers analysis</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name).
+5. NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion", "having watched"). Write in analytical, objective third person.
+6. TEMPORAL CONSISTENCY: All dates must align with the current year (2026). E.g. treat the 2026 World Cup as the upcoming or current major tournament. Avoid past references like 2024.
+7. SOURCE HANDLING: {instrucciones_tier}
+8. CROSS-LINKING: Near the end, include exactly one paragraph referring to the player's professional performance, linking to their tag (e.g. '<p><em>Curious about his actual performance on the pitch? Check out our <a href="/tag/[player-name-slug]/">Transfers analysis</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name).
 """
     elif seccion == "transfers":
         reglas_especificas = f"""
@@ -437,8 +439,10 @@ WRITING RULES:
 2. LENGTH: {min_w}-{max_w} words.
 3. OPENING: Start with the most dramatic financial figure or contract length. E.g. 'Eintracht Frankfurt have pulled off one of the cleanest robbery jobs in Bundesliga history.'
 4. STYLE: Conversational but heavily analytical on finances. Discuss player values, wages, and whether the club overpaid.
-5. SOURCE HANDLING: {instrucciones_tier}
-6. CROSS-LINKING: Near the end, include exactly one paragraph referring to their life off the pitch, linking to their tag (e.g. '<p><em>Want to know more about his life off the pitch? Read our <a href="/tag/[player-name-slug]/">Football Gossip section</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name).
+5. NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion"). Write in analytical, objective third person.
+6. TEMPORAL CONSISTENCY: All dates must align with the current year (2026).
+7. SOURCE HANDLING: {instrucciones_tier}
+8. CROSS-LINKING: Near the end, include exactly one paragraph referring to their life off the pitch, linking to their tag (e.g. '<p><em>Want to know more about his life off the pitch? Read our <a href="/tag/[player-name-slug]/">Football Gossip section</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name).
 """
     else:
         reglas_especificas = f"""
@@ -447,6 +451,8 @@ WRITING RULES:
 2. LENGTH: {min_w}-{max_w} words.
 3. OPENING: Start with the single most dramatic fact, stat, or consequence. Drop the reader into the middle of the action.
 4. STYLE: Standard columns, news, and controversy.
+5. NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion"). Write in analytical, objective third person.
+6. TEMPORAL CONSISTENCY: All dates must align with the current year (2026).
 """
 
     # 5. Categorías a sugerir
@@ -503,6 +509,8 @@ def limpiar_texto_ia(texto_html: str, titulo: str, resumen: str, fuente: str) ->
     prompt_limpieza = f"""You are a grumpy copy editor at a sports newspaper. Your only job is to clean up this draft.
 
 RULES:
+- NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion", "having watched"). Rewrite those parts into objective third-person analysis.
+- TEMPORAL CONSISTENCY: Ensure all dates make sense relative to the current year (2026).
 - Remove any phrase that sounds robotic, generic, or AI-generated
 - Replace vague praise ("incredible", "remarkable", "stellar") with specific descriptions of what happened
 - Cut any sentence that adds no information (filler)
