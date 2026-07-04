@@ -814,20 +814,71 @@ def buscar_imagen_wikimedia(search_query: str) -> tuple[str, str] | None:
     return None
 
 
-def generar_imagen_portada(titulo: str, search_query: str = "football match") -> tuple[str, str | None] | None:
+def generar_imagen_portada(titulo: str, search_query: str = "football match", equipo_asociado: str = "") -> tuple[str, str | None] | None:
     """
-    Intenta buscar una imagen real en Wikimedia Commons con atribución usando el search_query.
+    Intenta buscar una imagen real en Wikimedia Commons con atribución usando el search_query optimizado.
     Si falla, busca una imagen fotorrealista de stock usando Pexels/Pixabay.
     """
-    # 1. Intentar Wikimedia Commons primero con la consulta del LLM
-    wiki_res = buscar_imagen_wikimedia(search_query)
+    import random
+
+    # 1. Resolver el query usando el mapeo de clubes
+    query_final = search_query.strip().lower()
+    
+    MAPEO_IMAGENES_CLUBES = {
+        "real madrid": ["santiago bernabeu", "madrid stadium", "white soccer jersey"],
+        "barcelona": ["camp nou", "fc barcelona", "blue and red soccer"],
+        "manchester united": ["old trafford", "red soccer jersey"],
+        "manchester city": ["etihad stadium", "sky blue soccer"],
+        "chelsea": ["stamford bridge", "blue soccer jersey"],
+        "arsenal": ["emirates stadium", "red white soccer jersey"],
+        "liverpool": ["anfield", "red soccer jersey"],
+        "psg": ["parc des princes", "paris soccer"],
+        "bayern munich": ["allianz arena", "red soccer jersey"],
+        "juventus": ["juventus stadium", "black and white soccer jersey"],
+        "inter milan": ["san siro", "blue and black soccer jersey"],
+        "ac milan": ["san siro", "red and black soccer jersey"],
+        "real sociedad": ["anoeta stadium", "blue and white soccer jersey"],
+        "seleccion espanola": ["spain football", "red soccer jersey"],
+        "argentina": ["argentina football", "blue and white soccer jersey"],
+    }
+    
+    # Intentar coincidencia por el equipo detectado por la IA
+    coincidencia_equipo = None
+    if equipo_asociado:
+        eq_clean = equipo_asociado.strip().lower()
+        for k, v in MAPEO_IMAGENES_CLUBES.items():
+            if k in eq_clean or eq_clean in k:
+                coincidencia_equipo = random.choice(v)
+                break
+                
+    # Si no hay, intentar por palabras clave en el título
+    if not coincidencia_equipo:
+        titulo_l = titulo.lower()
+        for k, v in MAPEO_IMAGENES_CLUBES.items():
+            if k in titulo_l:
+                coincidencia_equipo = random.choice(v)
+                break
+                
+    if coincidencia_equipo:
+        query_final = coincidencia_equipo
+        log.info(f"📍 Mapeo de imagen activado. Query final: '{query_final}'")
+    else:
+        # Fallbacks genéricos si no es un equipo conocido o el query es muy abstracto
+        if "champions" in titulo.lower():
+            query_final = "champions league stadium"
+        elif "premier" in titulo.lower():
+            query_final = "english football stadium"
+        elif not query_final or any(w in query_final for w in ["contract", "deal", "transfer", "gossip", "money", "signing", "football match"]):
+            query_final = "soccer player pitch"
+
+    # 1. Intentar Wikimedia Commons primero con la consulta optimizada
+    wiki_res = buscar_imagen_wikimedia(query_final)
     if wiki_res:
         log.info("✅ Usando imagen de Wikimedia Commons.")
         return wiki_res
 
     # 2. Respaldo a Pexels / Pixabay
     log.info("⚠️ No se encontró imagen en Wikimedia. Usando imágenes de stock...")
-    import random
     img_path = DIR_IMG_PATH / f"portada_{int(time.time())}_{random.randint(100, 999)}.jpg"
     
     pexels_key = "" 
@@ -838,20 +889,14 @@ def generar_imagen_portada(titulo: str, search_query: str = "football match") ->
         pixabay_key = PIXABAY_API_KEY
     except ImportError:
         pass
-
-    query = "football match"
-    if "madrid" in titulo.lower(): query = "santiago bernabeu stadium"
-    elif "barcelona" in titulo.lower(): query = "camp nou stadium"
-    elif "champions" in titulo.lower(): query = "champions league stadium"
-    elif "premier" in titulo.lower(): query = "english football stadium"
     
     img_url = None
 
     # 1. Intentar Pexels
     try:
         if pexels_key and pexels_key != "TU_CLAVE_AQUI":
-            log.info(f"Buscando imagen en Pexels para: {query}")
-            url = f"https://api.pexels.com/v1/search?query={query}&per_page=15&orientation=landscape"
+            log.info(f"Buscando imagen en Pexels para: {query_final}")
+            url = f"https://api.pexels.com/v1/search?query={query_final}&per_page=15&orientation=landscape"
             headers = {"Authorization": pexels_key}
             req = requests.get(url, headers=headers, timeout=15)
             if req.status_code == 200:
@@ -865,8 +910,8 @@ def generar_imagen_portada(titulo: str, search_query: str = "football match") ->
     if not img_url:
         try:
             if pixabay_key and pixabay_key != "TU_CLAVE_AQUI":
-                log.info(f"Buscando imagen en Pixabay para: {query}")
-                query_pix = query.replace(" ", "+")
+                log.info(f"Buscando imagen en Pixabay para: {query_final}")
+                query_pix = query_final.replace(" ", "+")
                 url = f"https://pixabay.com/api/?key={pixabay_key}&q={query_pix}&image_type=photo&orientation=horizontal&per_page=15"
                 req = requests.get(url, timeout=15)
                 if req.status_code == 200:
@@ -1083,7 +1128,7 @@ def ejecutar_ciclo():
             # Generar imagen
             media_id = None
             credits = None
-            img_res = generar_imagen_portada(titulo_es, query_imagen)
+            img_res = generar_imagen_portada(titulo_es, query_imagen, equipo)
             if img_res:
                 img_path, credits = img_res
                 if img_path and Path(img_path).exists():
