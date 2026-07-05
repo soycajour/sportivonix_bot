@@ -764,7 +764,7 @@ def buscar_imagen_wikimedia(search_query: str) -> tuple[str, str] | None:
     if not words:
         search_query = "football match"
     else:
-        search_query = " ".join(words)
+        search_query = " ".join(words) + " soccer"
 
     log.info(f"Buscando en Wikimedia Commons para: '{search_query}'")
     
