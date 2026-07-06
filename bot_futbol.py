@@ -12,16 +12,25 @@ import time
 import base64
 import hashlib
 import logging
+import logging.handlers
 import requests
 import feedparser
-import subprocess
 import textwrap
 import re
 import unicodedata
+import html
+import mimetypes
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from duckduckgo_search import DDGS
+
+# Configurar encoding utf-8 para consola en Windows para evitar UnicodeEncodeError con emojis
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 # ─── Configuración ───────────────────────────────────────────────────────────
 # Ajustar el path para importar config.py desde el mismo directorio
@@ -34,7 +43,7 @@ from config import (
     DIR_IMAGENES, RSS_FEEDS, WP_CATEGORY_ID, WP_POST_STATUS,
     GEMINI_API_KEY as CONFIG_GEMINI_KEY,
     GEMINI_MODEL,
-    CAT_NEWS, CAT_FINANCE, CAT_TRANSFERS, CAT_GOSSIP,
+    CAT_NEWS, CAT_FINANCE, CAT_TRANSFERS, CAT_GOSSIP, CAT_CONTROVERSY,
     ARTICULOS_NEWS, ARTICULOS_TRANSFERS, ARTICULOS_GOSSIP,
     COOLDOWN_JUGADOR_DIAS, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     MIN_PALABRAS_GOSSIP, MAX_PALABRAS_GOSSIP,
@@ -43,15 +52,27 @@ from config import (
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_PATH = SCRIPT_DIR / ARCHIVO_LOG
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+
+# Configure root logger with RotatingFileHandler and StreamHandler
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+file_handler = logging.handlers.RotatingFileHandler(
+    LOG_PATH, maxBytes=10_000_000, backupCount=5, encoding="utf-8"
 )
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
 log = logging.getLogger("BotFutbol")
+
+# Verificar si WP_URL usa HTTPS
+if not WP_URL.startswith("https://"):
+    log.warning("⚠️ WP_URL no usa HTTPS. La contraseña de aplicación podría viajar en texto claro!")
 
 # ─── Registro de publicadas ───────────────────────────────────────────────────
 PUBLICADAS_PATH = SCRIPT_DIR / ARCHIVO_PUBLICADAS
@@ -67,31 +88,139 @@ WP_HEADERS = {"Content-Type": "application/json"}
 # 1. REGISTRO DE NOTICIAS PUBLICADAS
 # =============================================================================
 
+def normalizar_nombre(nombre: str) -> str:
+    """Normaliza un nombre/texto eliminando acentos, caracteres especiales, y dejándolo en minúsculas."""
+    if not nombre:
+        return ""
+    # Normalizar Unicode para separar diacríticos
+    normalized = unicodedata.normalize('NFKD', nombre)
+    ascii_encoded = normalized.encode('ASCII', 'ignore').decode('ASCII')
+    
+    # Mapeo manual para caracteres especiales no diacríticos comunes en Europa
+    custom_map = {
+        'ø': 'o', 'Ø': 'O', 'æ': 'ae', 'Æ': 'AE', 'ł': 'l', 'Ł': 'L',
+        'þ': 'th', 'Þ': 'TH', 'ß': 'ss', 'đ': 'd', 'Đ': 'D'
+    }
+    for char, replacement in custom_map.items():
+        ascii_encoded = ascii_encoded.replace(char, replacement)
+        
+    cleaned = ascii_encoded.lower().strip()
+    # Eliminar cualquier caracter que no sea letra, número, espacio o guion
+    cleaned = re.sub(r"[^a-z0-9\s-]", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+def obtener_palabras_clave(texto: str) -> set:
+    """Extrae palabras clave significativas de un texto para comprobar similitudes."""
+    palabras = re.findall(r'\b[a-z]{4,}\b', normalizar_nombre(texto))
+    stop_words = {
+        "with", "from", "that", "this", "news", "report", "show", "make", "will", "talk", "agree",
+        "about", "after", "again", "against", "their", "them", "then", "there", "these", "they",
+        "match", "game", "club", "team", "player"
+    }
+    return set(w for w in palabras if w not in stop_words)
+
+
+def es_titulo_similar(titulo: str, titulos_recientes: list, seccion_nueva: str = None) -> bool:
+    """Determina si un título es muy similar a alguno de los títulos ya publicados recientemente."""
+    if not titulos_recientes:
+        return False
+    keywords_nuevo = obtener_palabras_clave(titulo)
+    if not keywords_nuevo or len(keywords_nuevo) < 2:
+        return False
+    
+    for t_reciente in titulos_recientes:
+        if isinstance(t_reciente, dict):
+            title_reciente = t_reciente.get("title", "")
+            section_reciente = t_reciente.get("section", "")
+        else:
+            title_reciente = t_reciente
+            section_reciente = None
+            
+        keywords_reciente = obtener_palabras_clave(title_reciente)
+        if not keywords_reciente:
+            continue
+        interseccion = keywords_nuevo.intersection(keywords_reciente)
+        
+        # Si las secciones son conocidas y distintas (ej. Transfers vs Gossip), exigimos mucha mayor similitud para descartarlo
+        if seccion_nueva and section_reciente and seccion_nueva != section_reciente:
+            umbral = max(4, int(len(keywords_nuevo) * 0.8))
+        else:
+            # Misma sección o sección desconocida
+            umbral = min(3, max(2, int(len(keywords_nuevo) * 0.6)))
+            
+        if len(interseccion) >= umbral:
+            return True
+    return False
+
+
 def cargar_publicadas() -> dict:
+    """Carga el registro de noticias publicadas con manejo de errores y copias de seguridad en caso de corrupción."""
+    default_data = {
+        "publicadas": [],
+        "titulos_recientes": [],
+        "total_publicados": 0,
+        "ultima_actualizacion": None
+    }
     if PUBLICADAS_PATH.exists():
-        with open(PUBLICADAS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"publicadas": [], "total_publicados": 0, "ultima_actualizacion": None}
+        try:
+            with open(PUBLICADAS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "titulos_recientes" not in data:
+                    data["titulos_recientes"] = []
+                return data
+        except Exception:
+            log.exception("❌ publicadas.json corrupto, se hace backup y se reinicia.")
+            try:
+                backup_path = PUBLICADAS_PATH.with_suffix(".corrupto.bak")
+                PUBLICADAS_PATH.rename(backup_path)
+            except Exception:
+                log.exception("Error al renombrar el archivo corrupto.")
+    return default_data
 
 
 def guardar_publicadas(data: dict):
+    """Guarda las noticias publicadas en disco usando escritura atómica."""
     data["ultima_actualizacion"] = datetime.now(timezone.utc).isoformat()
-    with open(PUBLICADAS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    temp_path = PUBLICADAS_PATH.with_suffix(".tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        temp_path.replace(PUBLICADAS_PATH)
+    except Exception:
+        log.exception("❌ Error al guardar de forma atómica publicadas.json")
 
 
-def ya_fue_publicada(url: str, data: dict) -> bool:
+def ya_fue_publicada(url: str, titulo: str, data: dict, seccion: str = None) -> bool:
+    """Verifica si la URL ya está registrada o si hay un título similar publicado."""
     url_hash = hashlib.md5(url.encode()).hexdigest()
-    return url_hash in data["publicadas"]
+    if url_hash in data["publicadas"]:
+        return True
+    if es_titulo_similar(titulo, data.get("titulos_recientes", []), seccion):
+        log.warning(f"⚠️ Detección de duplicado por similitud de título: '{titulo}'")
+        return True
+    return False
 
 
-def marcar_como_publicada(url: str, data: dict):
+def marcar_como_publicada(url: str, titulo: str, data: dict, seccion: str = None):
+    """Registra una noticia como publicada."""
     url_hash = hashlib.md5(url.encode()).hexdigest()
     data["publicadas"].append(url_hash)
+    
+    if "titulos_recientes" not in data:
+        data["titulos_recientes"] = []
+    # Almacenar como diccionario con sección para poder filtrar con precisión después
+    data["titulos_recientes"].append({"title": titulo, "section": seccion})
+    
     data["total_publicados"] = len(data["publicadas"])
-    # Limitar el historial a los últimos 500 para no crecer indefinidamente
+    
+    # Limitar el historial a los últimos 500
     if len(data["publicadas"]) > 500:
         data["publicadas"] = data["publicadas"][-500:]
+    if len(data["titulos_recientes"]) > 500:
+        data["titulos_recientes"] = data["titulos_recientes"][-500:]
+        
     guardar_publicadas(data)
 
 
@@ -113,13 +242,13 @@ def buscar_web(query: str, num_results: int = 5) -> list:
                     "snippet": r.get("body", ""),
                     "url": r.get("href", "")
                 })
-    except Exception as e:
-        log.error(f"Error al buscar en la web: {e}")
+    except Exception:
+        log.exception(f"Error al buscar en la web para la query: '{query}'")
     return resultados
 
 
 def enviar_alerta_telegram(titulo: str, url: str, palabras: list) -> bool:
-    """Envía una alerta de contenido sensible por Telegram."""
+    """Envía una alerta de contenido sensible por Telegram con reintentos."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     
@@ -138,15 +267,18 @@ def enviar_alerta_telegram(titulo: str, url: str, palabras: list) -> bool:
         "text": mensaje,
         "parse_mode": "Markdown"
     }
-    try:
-        r = requests.post(telegram_url, json=payload, timeout=10)
-        if r.status_code == 200:
-            log.info("Alerta de Telegram enviada con éxito.")
-            return True
-        else:
-            log.error(f"Error al enviar alerta de Telegram: {r.status_code} - {r.text}")
-    except Exception as e:
-        log.error(f"Excepción al enviar Telegram: {e}")
+    
+    for intento in range(3):
+        try:
+            r = requests.post(telegram_url, json=payload, timeout=10)
+            if r.status_code == 200:
+                log.info("Alerta de Telegram enviada con éxito.")
+                return True
+            else:
+                log.error(f"Error al enviar alerta de Telegram (Intento {intento+1}/3): {r.status_code} - {r.text}")
+        except Exception:
+            log.exception(f"Excepción al enviar Telegram (Intento {intento+1}/3)")
+        time.sleep(2 * (intento + 1))
     return False
 
 
@@ -156,7 +288,7 @@ def fuente_tier(url: str) -> str:
     
     # Fuentes confirmadas / oficiales
     if any(d in domain for d in [
-        ".fc.com", "realmadrid.com", "barcelona.fc", "arsenal.com", "chelseafc.com",
+        ".fc.com", "realmadrid.com", "fcbarcelona.com", "arsenal.com", "chelseafc.com",
         "manutd.com", "mancity.com", "liverpoolfc.com", "bbc.co.uk/sport", "bbc.com/sport",
         "reuters.com", "apnews.com"
     ]):
@@ -180,23 +312,32 @@ def cargar_cooldowns() -> dict:
             with open(COOLDOWNS_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            pass
+            log.exception("Error al cargar cooldowns.json corrupto.")
+            try:
+                COOLDOWNS_PATH.rename(COOLDOWNS_PATH.with_suffix(".corrupto.bak"))
+            except Exception:
+                pass
     return {}
 
 
 def guardar_cooldowns(data: dict):
-    """Guarda los cooldowns de jugadores al archivo json."""
+    """Guarda los cooldowns de jugadores al archivo json usando escritura atómica."""
+    temp_path = COOLDOWNS_PATH.with_suffix(".tmp")
     try:
-        with open(COOLDOWNS_PATH, "w", encoding="utf-8") as f:
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.error(f"Error al guardar cooldowns: {e}")
+        temp_path.replace(COOLDOWNS_PATH)
+    except Exception:
+        log.exception("Error al guardar cooldowns de forma atómica.")
 
 
 def verificar_cooldown(jugador: str, seccion: str) -> bool:
     """Devuelve True si el jugador está en cooldown para esa sección (menor a 3 días)."""
+    if not jugador:
+        return False
     cooldowns = cargar_cooldowns()
-    player_data = cooldowns.get(jugador, {})
+    jugador_normalizado = normalizar_nombre(jugador)
+    player_data = cooldowns.get(jugador_normalizado, {})
     last_pub_str = player_data.get(seccion)
     if not last_pub_str:
         return False
@@ -207,21 +348,24 @@ def verificar_cooldown(jugador: str, seccion: str) -> bool:
         if delta.days < COOLDOWN_JUGADOR_DIAS:
             return True
     except Exception:
-        pass
+        log.exception("Error al verificar cooldown")
     return False
 
 
 def registrar_cooldown(jugador: str, seccion: str):
     """Registra la fecha actual como última publicación de ese jugador en esa sección."""
+    if not jugador:
+        return
     cooldowns = cargar_cooldowns()
-    if jugador not in cooldowns:
-        cooldowns[jugador] = {}
-    cooldowns[jugador][seccion] = datetime.now(timezone.utc).isoformat()
+    jugador_normalizado = normalizar_nombre(jugador)
+    if jugador_normalizado not in cooldowns:
+        cooldowns[jugador_normalizado] = {}
+    cooldowns[jugador_normalizado][seccion] = datetime.now(timezone.utc).isoformat()
     guardar_cooldowns(cooldowns)
 
 
 def extraer_entidades(titulo: str, resumen: str) -> tuple:
-    """Usa el LLM principal para extraer el nombre del jugador y equipo mencionados."""
+    """Usa los LLM configurados para extraer el nombre del jugador y equipo mencionados."""
     prompt = f"""Extract the main professional football player name and their associated club/national team mentioned in this news.
 Return a clean JSON object with keys "player" and "team". If no player or team is found, return empty strings. Do NOT output markdown, backticks, or any extra text. ONLY raw JSON.
 
@@ -230,28 +374,52 @@ Summary: {resumen}
 """
     try:
         from config import LLM_PROVIDERS
-        provider = LLM_PROVIDERS[0]
+    except ImportError:
+        return "", ""
+
+    for provider in LLM_PROVIDERS:
+        name = provider.get("name", "Unknown")
         ptype = provider.get("type", "")
         api_key = provider.get("api_key", "")
         model = provider.get("model", "")
         url = provider.get("url", "")
         
-        if ptype == "openai_compatible":
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-            }
-            resp = requests.post(url, json=payload, headers=headers, timeout=15)
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-            raw = re.sub(r'```json\s*', '', raw)
-            raw = re.sub(r'\s*```', '', raw)
+        try:
+            log.info(f"Extracting entities using {name}...")
+            
+            if ptype == "gemini":
+                gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.0, "maxOutputTokens": 300}
+                }
+                resp = requests.post(gemini_url, json=payload, timeout=15)
+                resp.raise_for_status()
+                raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            elif ptype == "openai_compatible":
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                }
+                resp = requests.post(url, json=payload, headers=headers, timeout=15)
+                resp.raise_for_status()
+                raw = resp.json()["choices"][0]["message"]["content"].strip()
+            else:
+                continue
+
+            # Clean potential Markdown wrappers
+            raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
+            raw = re.sub(r'\s*```$', '', raw)
+            
             data = json.loads(raw)
-            return data.get("player", "").strip(), data.get("team", "").strip()
-    except Exception as e:
-        log.warning(f"Error al extraer entidades con IA: {e}")
+            player = (data.get("player") or "").strip()
+            team = (data.get("team") or "").strip()
+            return player, team
+        except Exception:
+            log.exception(f"Error al extraer entidades con {name}")
+            
     return "", ""
 
 
@@ -262,7 +430,7 @@ def obtener_o_crear_tag(name: str) -> int:
     name_clean = name.strip()
     try:
         search_url = f"{WP_URL}/wp-json/wp/v2/tags?search={requests.utils.quote(name_clean)}"
-        r = requests.get(search_url, auth=WP_AUTH)
+        r = requests.get(search_url, auth=WP_AUTH, timeout=15)
         if r.status_code == 200:
             results = r.json()
             for tag in results:
@@ -271,11 +439,11 @@ def obtener_o_crear_tag(name: str) -> int:
         
         create_url = f"{WP_URL}/wp-json/wp/v2/tags"
         payload = {"name": name_clean}
-        rc = requests.post(create_url, auth=WP_AUTH, json=payload, headers=WP_HEADERS)
+        rc = requests.post(create_url, auth=WP_AUTH, json=payload, headers=WP_HEADERS, timeout=15)
         if rc.status_code == 201:
             return rc.json()["id"]
-    except Exception as e:
-        log.error(f"Error al obtener/crear tag '{name_clean}': {e}")
+    except Exception:
+        log.exception(f"Error al obtener/crear tag '{name_clean}'")
     return None
 
 
@@ -284,7 +452,7 @@ def obtener_o_crear_tag(name: str) -> int:
 # =============================================================================
 
 def obtener_noticias_rss(feeds_a_leer: list = None) -> list:
-    """Lee múltiples feeds RSS y devuelve lista de entradas únicas de fútbol."""
+    """Lee múltiples feeds RSS usando requests (con timeout) y devuelve lista de entradas únicas de fútbol."""
     noticias = []
     palabras_clave_futbol = [
         "fútbol", "futbol", "football", "soccer", "gol", "goal", "liga",
@@ -297,27 +465,33 @@ def obtener_noticias_rss(feeds_a_leer: list = None) -> list:
     ]
 
     target_feeds = feeds_a_leer if feeds_a_leer is not None else RSS_FEEDS
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SportivoNixBot/1.0)"}
+    
     for feed_url in target_feeds:
         try:
             log.info(f"Leyendo feed: {feed_url}")
-            feed = feedparser.parse(feed_url, request_headers={
-                "User-Agent": "Mozilla/5.0 (compatible; SportivoNixBot/1.0)"
-            })
-            for entry in feed.entries[:10]:  # Máximo 10 por feed
-                titulo = entry.get("title", "").lower()
-                resumen = entry.get("summary", entry.get("description", "")).lower()
-                texto_completo = titulo + " " + resumen
-                # Filtrar solo noticias de fútbol
-                if any(kw in texto_completo for kw in palabras_clave_futbol):
-                    noticias.append({
-                        "titulo": entry.get("title", ""),
-                        "url": entry.get("link", entry.get("id", "")),
-                        "resumen": entry.get("summary", entry.get("description", "")),
-                        "publicado": entry.get("published", ""),
-                        "fuente": urlparse(feed_url).netloc,
-                    })
-        except Exception as e:
-            log.warning(f"Error leyendo feed {feed_url}: {e}")
+            # Descargar feed usando requests con timeout de 15 segundos
+            resp = requests.get(feed_url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                feed = feedparser.parse(resp.content)
+                for entry in feed.entries[:10]:  # Máximo 10 por feed
+                    titulo = entry.get("title", "")
+                    resumen = entry.get("summary", entry.get("description", ""))
+                    texto_completo = (titulo + " " + resumen).lower()
+                    
+                    # Filtrar solo noticias de fútbol con límites de palabra (\b) para evitar falsos positivos
+                    if any(re.search(rf'\b{re.escape(kw)}\b', texto_completo) for kw in palabras_clave_futbol):
+                        noticias.append({
+                            "titulo": entry.get("title", ""),
+                            "url": entry.get("link", entry.get("id", "")),
+                            "resumen": entry.get("summary", entry.get("description", "")),
+                            "publicado": entry.get("published", ""),
+                            "fuente": urlparse(feed_url).netloc,
+                        })
+            else:
+                log.error(f"Error HTTP {resp.status_code} al descargar feed {feed_url}")
+        except Exception:
+            log.exception(f"Error leyendo feed {feed_url}")
 
     # Eliminar duplicados por URL
     vistos = set()
@@ -331,21 +505,16 @@ def obtener_noticias_rss(feeds_a_leer: list = None) -> list:
     return unicas
 
 
-def elegir_noticia_nueva(noticias: list, publicadas: dict):
-    """Devuelve la primera noticia que no haya sido publicada aún."""
-    for noticia in noticias:
-        if noticia["url"] and not ya_fue_publicada(noticia["url"], publicadas):
-            return noticia
-    return None
-
-
 # =============================================================================
 # 3. REDACCIÓN DEL ARTÍCULO (Anti-IA, tono periodístico humano)
 # =============================================================================
 
 def limpiar_html(texto: str) -> str:
-    """Elimina etiquetas HTML básicas del texto."""
-    return re.sub(r"<[^>]+>", "", texto).strip()
+    """Elimina etiquetas HTML básicas y decodifica entidades HTML del texto."""
+    if not texto:
+        return ""
+    texto_sin_etiquetas = re.sub(r"<[^>]+>", "", texto)
+    return html.unescape(texto_sin_etiquetas).strip()
 
 
 # ─── BANNED AI WORDS & PHRASES ────────────────────────────────────────────────
@@ -420,39 +589,28 @@ ADDITIONAL WEB RESEARCH RESULTS (integrate these facts into your column to add d
 """
 
     # 4. Reglas específicas por sección
-    if seccion == "gossip":
-        reglas_especificas = f"""
-WRITING RULES:
-1. LANGUAGE: Write entirely in English. Translate any Spanish/other language source material.
+    reglas_comunes = f"""WRITING RULES:
+1. LANGUAGE: Write entirely in English. Translate any source material from Spanish/other languages.
 2. LENGTH: {min_w}-{max_w} words.
-3. OPENING: Start with a striking, dramatic, or scandalous hook about the player's life or choices. E.g. 'Neymar has once again proven that money cannot buy discretion.'
-4. STYLE: Free-style, opinionated, and gossipy. Discuss salaries, purchases, relationships, or fan sentiment, but always include the official response/denial if present in the research.
-5. NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion", "having watched"). Write in analytical, objective third person.
-6. TEMPORAL CONSISTENCY: All dates must align with the current year (2026). E.g. treat the 2026 World Cup as the upcoming or current major tournament. Avoid past references like 2024.
-7. SOURCE HANDLING: {instrucciones_tier}
+3. NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion", "having watched"). Write in analytical, objective third person.
+4. TEMPORAL CONSISTENCY: All dates must align with the current year (2026). E.g. treat the 2026 World Cup as the upcoming or current major tournament. Avoid past references like 2024.
+"""
+    if instrucciones_tier:
+        reglas_comunes += f"5. SOURCE HANDLING: {instrucciones_tier}\n"
+
+    if seccion == "gossip":
+        reglas_especificas = reglas_comunes + f"""6. OPENING: Start with a striking, dramatic, or scandalous hook about the player's life or choices. E.g. 'Neymar has once again proven that money cannot buy discretion.'
+7. STYLE: Free-style, opinionated, and gossipy. Discuss salaries, purchases, relationships, or fan sentiment, but always include the official response/denial if present in the research.
 8. CROSS-LINKING: Near the end, include exactly one paragraph referring to the player's professional performance, linking to their tag (e.g. '<p><em>Curious about his actual performance on the pitch? Check out our <a href="/tag/[player-name-slug]/">Transfers analysis</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name).
 """
     elif seccion == "transfers":
-        reglas_especificas = f"""
-WRITING RULES:
-1. LANGUAGE: Write entirely in English.
-2. LENGTH: {min_w}-{max_w} words.
-3. OPENING: Start with the most dramatic financial figure or contract length. E.g. 'Eintracht Frankfurt have pulled off one of the cleanest robbery jobs in Bundesliga history.'
-4. STYLE: Conversational but heavily analytical on finances. Discuss player values, wages, and whether the club overpaid.
-5. NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion"). Write in analytical, objective third person.
-6. TEMPORAL CONSISTENCY: All dates must align with the current year (2026).
-7. SOURCE HANDLING: {instrucciones_tier}
+        reglas_especificas = reglas_comunes + f"""6. OPENING: Start with the most dramatic financial figure or contract length. E.g. 'Eintracht Frankfurt have pulled off one of the cleanest robbery jobs in Bundesliga history.'
+7. STYLE: Conversational but heavily analytical on finances. Discuss player values, wages, and whether the club overpaid.
 8. CROSS-LINKING: Near the end, include exactly one paragraph referring to their life off the pitch, linking to their tag (e.g. '<p><em>Want to know more about his life off the pitch? Read our <a href="/tag/[player-name-slug]/">Football Gossip section</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name).
 """
     else:
-        reglas_especificas = f"""
-WRITING RULES:
-1. LANGUAGE: Write entirely in English.
-2. LENGTH: {min_w}-{max_w} words.
-3. OPENING: Start with the single most dramatic fact, stat, or consequence. Drop the reader into the middle of the action.
-4. STYLE: Standard columns, news, and controversy.
-5. NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion"). Write in analytical, objective third person.
-6. TEMPORAL CONSISTENCY: All dates must align with the current year (2026).
+        reglas_especificas = reglas_comunes + """6. OPENING: Start with the single most dramatic fact, stat, or consequence. Drop the reader into the middle of the action.
+7. STYLE: Standard columns, news, and controversy.
 """
 
     # 5. Categorías a sugerir
@@ -584,8 +742,8 @@ DRAFT TO CLEAN:
                 log.warning(f"Limpieza devolvió texto demasiado corto o sin HTML. Usando original.")
                 return texto_html
 
-        except Exception as e:
-            log.warning(f"Error en limpieza con {name}: {e}")
+        except Exception:
+            log.exception(f"Error en limpieza con {name}")
             continue
 
     log.warning("No se pudo ejecutar la limpieza anti-IA. Usando texto original.")
@@ -676,14 +834,21 @@ def redactar_articulo(titulo: str, resumen: str, fuente: str, seccion: str = "ne
                             search_query = sq_lines[0].replace("*", "").strip()
 
                     # Extraer CATEGORIES
-                    categorias_list = [3] # Siempre 3 (Noticias) por defecto
+                    if seccion == "transfers":
+                        default_cats = [CAT_TRANSFERS, CAT_FINANCE]
+                    elif seccion == "gossip":
+                        default_cats = [CAT_GOSSIP]
+                    else:
+                        default_cats = [CAT_NEWS]
+                        
+                    categorias_list = default_cats
                     match_cat = re.search(r'\**\[CATEGOR(?:Y|IES)\]\**:?.*', body_part, re.IGNORECASE | re.DOTALL)
                     if match_cat:
                         cat_str = match_cat.group(0)
                         body_part = body_part[:match_cat.start()].strip()
                         nums = re.findall(r'\d+', cat_str)
                         if nums:
-                            categorias_list = list(set([3] + [int(n) for n in nums if int(n) in [3, 4, 5, 6]]))
+                            categorias_list = list(set(default_cats + [int(n) for n in nums if int(n) in [CAT_NEWS, CAT_FINANCE, CAT_TRANSFERS, CAT_GOSSIP, CAT_CONTROVERSY]]))
 
                     # Limpiar las posibles etiquetas markdown (```html o ```)
                     body_part = re.sub(r"^```(?:html|markdown|text)?\n?", "", body_part, flags=re.IGNORECASE)
@@ -695,7 +860,13 @@ def redactar_articulo(titulo: str, resumen: str, fuente: str, seccion: str = "ne
                 else:
                     lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
                     if len(lines) > 1:
-                        return lines[0], "\n".join(lines[1:]), [3], "football match"
+                        if seccion == "transfers":
+                            default_cats = [CAT_TRANSFERS, CAT_FINANCE]
+                        elif seccion == "gossip":
+                            default_cats = [CAT_GOSSIP]
+                        else:
+                            default_cats = [CAT_NEWS]
+                        return lines[0], "\n".join(lines[1:]), default_cats, "football match"
                     raise ValueError("Respuesta mal formateada sin [TITLE] y [BODY]")
                     
             except Exception as e:
@@ -706,12 +877,21 @@ def redactar_articulo(titulo: str, resumen: str, fuente: str, seccion: str = "ne
                 if intento < 1:
                     log.warning(f"Error con {name}: {e}. Reintentando...")
                     time.sleep(5)
+                else:
+                    log.exception(f"Excepción al redactar con {name}")
                     
     # Respaldo final absoluto si todas las APIs fallan
     log.error("❌ Todas las APIs fallaron. Usando texto básico de respaldo.")
     resumen_limpio = limpiar_html(resumen)
     fallback_content = f"<h2>Breaking News</h2><p>{resumen_limpio}</p><p>This breaking news is being covered extensively by Sportivonix. We will update as more information becomes available. Original source: <strong>{fuente}</strong>.</p>"
-    return titulo, fallback_content, [3], "football match"
+    
+    if seccion == "transfers":
+        default_cats = [CAT_TRANSFERS, CAT_FINANCE]
+    elif seccion == "gossip":
+        default_cats = [CAT_GOSSIP]
+    else:
+        default_cats = [CAT_NEWS]
+    return titulo, fallback_content, default_cats, "football match"
 
 
 # =============================================================================
@@ -754,7 +934,6 @@ def describir_imagen_para_prompt(titulo: str) -> str:
 def buscar_imagen_wikimedia(search_query: str) -> tuple[str, str] | None:
     """Busca una imagen libre de derechos en Wikimedia Commons usando la consulta especificada."""
     # Eliminar acentos y caracteres especiales de la consulta
-    import unicodedata
     search_query = unicodedata.normalize('NFKD', search_query).encode('ASCII', 'ignore').decode('ASCII')
     
     # Filtrar búsquedas genéricas
@@ -768,7 +947,6 @@ def buscar_imagen_wikimedia(search_query: str) -> tuple[str, str] | None:
 
     log.info(f"Buscando en Wikimedia Commons para: '{search_query}'")
     
-    import random
     url = "https://commons.wikimedia.org/w/api.php"
     params = {
         "action": "query",
@@ -812,12 +990,15 @@ def buscar_imagen_wikimedia(search_query: str) -> tuple[str, str] | None:
                 selected = random.choice(valid_images)
                 img_path = DIR_IMG_PATH / f"wikimedia_{int(time.time())}_{random.randint(100, 999)}.jpg"
                 log.info(f"Descargando imagen de Wikimedia: {selected['url']}")
-                img_data = requests.get(selected["url"], headers=headers, timeout=30).content
-                with open(img_path, 'wb') as f:
-                    f.write(img_data)
-                return str(img_path), selected["credit"]
-    except Exception as e:
-        log.warning(f"Error en búsqueda de Wikimedia: {e}")
+                resp_img = requests.get(selected["url"], headers=headers, timeout=30)
+                if resp_img.status_code == 200 and resp_img.headers.get("Content-Type", "").startswith("image/"):
+                    with open(img_path, 'wb') as f:
+                        f.write(resp_img.content)
+                    return str(img_path), selected["credit"]
+                else:
+                    log.warning(f"Error descargando imagen de Wikimedia: HTTP {resp_img.status_code}")
+    except Exception:
+        log.exception("Error en búsqueda de Wikimedia")
         
     return None
 
@@ -833,9 +1014,6 @@ def generar_imagen_cloudflare_ai(titulo: str, query_final: str) -> str | None:
     except ImportError:
         return None
 
-    import base64
-    import random
-    
     log.info(f"🤖 Intentando generar imagen con Cloudflare Workers AI (FLUX) para: '{query_final}'")
     
     # Construir un prompt fotorrealista de alta calidad basado en el query final y la fórmula fotográfica
@@ -867,19 +1045,18 @@ def generar_imagen_cloudflare_ai(titulo: str, query_final: str) -> str | None:
                     f.write(image_bytes)
                 log.info(f"✅ Imagen generada y guardada con éxito por IA: {img_path}")
                 return str(img_path)
-    except Exception as e:
-        log.warning(f"Error al generar imagen con Cloudflare Workers AI: {e}")
+    except Exception:
+        log.exception("Error al generar imagen con Cloudflare Workers AI")
         
     return None
 
 
 def generar_imagen_portada(titulo: str, search_query: str = "football match", equipo_asociado: str = "") -> tuple[str, str | None] | None:
     """
-    Intenta buscar una imagen real en Wikimedia Commons con atribución usando el search_query optimizado.
-    Si falla, busca una imagen fotorrealista de stock usando Pexels/Pixabay.
+    Intenta generar una imagen con IA usando Cloudflare Workers AI (FLUX) primero.
+    Si falla, busca una imagen en Wikimedia Commons con atribución usando el query optimizado.
+    Como último recurso, busca una imagen fotorrealista de stock en Pexels/Pixabay.
     """
-    import random
-
     # 1. Resolver el query usando el mapeo de clubes
     query_final = search_query.strip().lower()
     
@@ -935,7 +1112,7 @@ def generar_imagen_portada(titulo: str, search_query: str = "football match", eq
     if ai_img:
         return ai_img, "Generated by Cloudflare Workers AI (FLUX.1 [schnell])"
 
-    # 1. Intentar Wikimedia Commons primero con la consulta optimizada
+    # 1. Intentar Wikimedia Commons si la generación por IA falló
     wiki_res = buscar_imagen_wikimedia(query_final)
     if wiki_res:
         log.info("✅ Usando imagen de Wikimedia Commons.")
@@ -967,8 +1144,8 @@ def generar_imagen_portada(titulo: str, search_query: str = "football match", eq
                 photos = req.json().get('photos', [])
                 if photos:
                     img_url = random.choice(photos)['src']['large2x']
-    except Exception as e:
-        log.warning(f"Error con Pexels: {e}")
+    except Exception:
+        log.exception("Error con Pexels")
 
     # 2. Intentar Pixabay si Pexels falló
     if not img_url:
@@ -982,8 +1159,8 @@ def generar_imagen_portada(titulo: str, search_query: str = "football match", eq
                     hits = req.json().get('hits', [])
                     if hits:
                         img_url = random.choice(hits)['largeImageURL']
-        except Exception as e:
-            log.warning(f"Error con Pixabay: {e}")
+        except Exception:
+            log.exception("Error con Pixabay")
 
     # 3. Imagen genérica si ambos fallaron
     if not img_url:
@@ -993,13 +1170,17 @@ def generar_imagen_portada(titulo: str, search_query: str = "football match", eq
     # Descargar
     try:
         log.info("Descargando imagen fotográfica...")
-        img_data = requests.get(img_url, timeout=30).content
-        with open(img_path, 'wb') as f:
-            f.write(img_data)
-        log.info(f"Imagen descargada con éxito: {img_path}")
-        return str(img_path), None
-    except Exception as e:
-        log.warning(f"Error final al descargar la imagen: {e}")
+        resp_stock = requests.get(img_url, timeout=30)
+        if resp_stock.status_code == 200 and resp_stock.headers.get("Content-Type", "").startswith("image/"):
+            with open(img_path, 'wb') as f:
+                f.write(resp_stock.content)
+            log.info(f"Imagen descargada con éxito: {img_path}")
+            return str(img_path), None
+        else:
+            log.warning(f"Error descargando imagen de stock: HTTP {resp_stock.status_code}")
+            return None
+    except Exception:
+        log.exception("Error final al descargar la imagen")
         return None
 
 
@@ -1014,9 +1195,13 @@ def subir_imagen_a_wordpress(img_path: str, titulo: str) -> int | None:
         with open(img_path, "rb") as f:
             img_data = f.read()
 
+        mime_type, _ = mimetypes.guess_type(img_path)
+        if not mime_type:
+            mime_type = "image/jpeg"
+
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Type": "image/png",
+            "Content-Type": mime_type,
         }
         resp = requests.post(
             f"{WP_URL}/wp-json/wp/v2/media",
@@ -1029,23 +1214,16 @@ def subir_imagen_a_wordpress(img_path: str, titulo: str) -> int | None:
         media_id = resp.json().get("id")
         log.info(f"Imagen subida a WordPress. Media ID: {media_id}")
         return media_id
-    except Exception as e:
-        log.error(f"Error subiendo imagen a WordPress: {e}")
+    except Exception:
+        log.exception("Error subiendo imagen a WordPress")
         return None
 
 
 def generar_slug(titulo: str) -> str:
-    """Genera un slug SEO-friendly a partir del título."""
-    slug = titulo.lower()
-    # Reemplazar caracteres especiales
-    reemplazos = {
-        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u",
-        "ü": "u", "ñ": "n", "ç": "c",
-    }
-    for char, repl in reemplazos.items():
-        slug = slug.replace(char, repl)
-    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
-    slug = re.sub(r"\s+", "-", slug.strip())
+    """Genera un slug SEO-friendly a partir del título utilizando normalización de caracteres universal."""
+    normalized_title = normalizar_nombre(titulo)
+    # Reemplazar espacios por guiones y limpiar
+    slug = re.sub(r"\s+", "-", normalized_title.strip())
     slug = re.sub(r"-+", "-", slug)
     return slug[:80]  # Máximo 80 caracteres
 
@@ -1090,7 +1268,7 @@ def publicar_en_wordpress(titulo: str, contenido: str, media_id: int | None, cat
         log.info(f"✅ Post publicado: {post_data.get('link')} (ID: {post_data.get('id')})")
         return post_data
     except Exception as e:
-        log.error(f"Error publicando en WordPress: {e}")
+        log.exception("Error publicando en WordPress")
         if hasattr(e, "response") and e.response is not None:
             log.error(f"Respuesta del servidor: {e.response.text[:500]}")
         return None
@@ -1099,6 +1277,135 @@ def publicar_en_wordpress(titulo: str, contenido: str, media_id: int | None, cat
 # =============================================================================
 # 6. CICLO PRINCIPAL
 # =============================================================================
+
+def procesar_noticia(noticia: dict, sec: dict, publicadas: dict) -> bool:
+    """Procesa una única noticia: extrae entidades, comprueba cooldowns, redacta, genera imagen, publica y alerta.
+    Devuelve True si la noticia se publicó correctamente, False en caso contrario."""
+    titulo = noticia.get("titulo", "")
+    url = noticia.get("url", "")
+    resumen = noticia.get("resumen", "")
+    fuente = noticia.get("fuente", "")
+
+    # Extraer entidad (jugador y equipo)
+    jugador, equipo = extraer_entidades(titulo, resumen)
+    if jugador:
+        log.info(f"   Entidades detectadas: Jugador={jugador}, Equipo={equipo}")
+        # Verificar Cooldown
+        if verificar_cooldown(jugador, sec["name"]):
+            log.warning(f"   ⚠️ Jugador '{jugador}' está en cooldown para la sección '{sec['name']}'. Saltando.")
+            # No marcar como publicada en cooldown para poder cubrirla más adelante si expira.
+            return False
+
+    # Clasificar fuente (Tier)
+    tier = fuente_tier(url)
+    log.info(f"   Clasificación de confianza de la fuente: {tier}")
+
+    # Investigación adicional
+    datos_investigacion = ""
+    if sec["name"] == "transfers" and jugador:
+        results = buscar_web(f"{jugador} market value salary transfer fee history", num_results=3)
+        datos_investigacion = "\n".join([f"- Title: {r['title']}\n  Snippet: {r['snippet']}\n  URL: {r['url']}" for r in results])
+    elif sec["name"] == "gossip" and jugador:
+        results_g = buscar_web(f"{jugador} gossip private lifestyle purchases", num_results=3)
+        results_resp = buscar_web(f"{jugador} official statement responds denies", num_results=2)
+        
+        datos_investigacion = "Gossip & Fan Reaction:\n"
+        datos_investigacion += "\n".join([f"- Title: {r['title']}\n  Snippet: {r['snippet']}" for r in results_g])
+        if results_resp:
+            datos_investigacion += "\n\nOfficial Responses/Denials:\n"
+            datos_investigacion += "\n".join([f"- Title: {r['title']}\n  Snippet: {r['snippet']}" for r in results_resp])
+
+    # Redactar artículo
+    try:
+        titulo_final, contenido, categorias_retornadas, query_imagen = redactar_articulo(
+            titulo=titulo,
+            resumen=resumen,
+            fuente=fuente,
+            seccion=sec["name"],
+            datos_investigacion=datos_investigacion,
+            tier=tier
+        )
+    except Exception:
+        log.exception("Error en redacción del artículo.")
+        # No marcamos como publicada si falló la redacción para reintentar con otro proveedor o ciclo
+        return False
+
+    # Validación mínima del contenido antes de publicar
+    if not contenido or len(contenido.strip()) < 200 or "<p>" not in contenido:
+        log.error(f"❌ El contenido generado para '{titulo}' está vacío o mal formado. Abortando publicación.")
+        return False
+
+    # Generar imagen
+    media_id = None
+    credits = None
+    img_res = generar_imagen_portada(titulo_final, query_imagen, equipo)
+    if img_res:
+        img_path, credits = img_res
+        if img_path and Path(img_path).exists():
+            media_id = subir_imagen_a_wordpress(img_path, titulo_final)
+            try:
+                Path(img_path).unlink()
+            except Exception:
+                pass
+
+    # Créditos del fotógrafo
+    if credits:
+        contenido += f'\n\n<p style="font-size: 11px; color: #777777; font-style: italic; text-align: right; margin-top: 20px;">{credits}</p>'
+
+    # Crear tags de jugador y equipo
+    tags_ids = []
+    if jugador:
+        id_tag_jugador = obtener_o_crear_tag(jugador)
+        if id_tag_jugador:
+            tags_ids.append(id_tag_jugador)
+    if equipo:
+        id_tag_equipo = obtener_o_crear_tag(equipo)
+        if id_tag_equipo:
+            tags_ids.append(id_tag_equipo)
+
+    # Determinar categorías a usar: combinar las retornadas por la IA con las configuradas por defecto
+    categorias_usar = list(set(sec["categories"] + categorias_retornadas))
+
+    # Publicar en WordPress
+    resultado = publicar_en_wordpress(
+        titulo=titulo_final,
+        contenido=contenido,
+        media_id=media_id,
+        categorias=categorias_usar,
+        tags=tags_ids if tags_ids else None
+    )
+
+    if resultado:
+        marcar_como_publicada(url, titulo_final, publicadas, sec["name"])
+        if jugador:
+            registrar_cooldown(jugador, sec["name"])
+        log.info(f"✅ [{sec['name'].upper()}] Publicado con éxito: {resultado.get('link')}")
+        
+        # Filtro de palabras sensibles (con límites de palabra \b para evitar falsos positivos)
+        PALABRAS_SENSIBLES = [
+            "affair", "divorce", "arrested", "assault", "lawsuit", "sued",
+            "cheating", "scandal", "drugs", "doping", "racism", "abuse",
+            "court", "prison", "domestic", "victim", "sexual"
+        ]
+        
+        # Buscar palabras en contenido y título respetando límites de palabras
+        contenido_lower = contenido.lower()
+        titulo_lower = titulo_final.lower()
+        palabras_detectadas = [
+            w for w in PALABRAS_SENSIBLES 
+            if re.search(r'\b' + re.escape(w) + r'\b', contenido_lower) 
+            or re.search(r'\b' + re.escape(w) + r'\b', titulo_lower)
+        ]
+        
+        if palabras_detectadas:
+            log.warning(f"⚠️ Palabras de riesgo detectadas: {palabras_detectadas}. Enviando alerta por Telegram...")
+            enviar_alerta_telegram(titulo_final, resultado.get("link"), palabras_detectadas)
+        return True
+    else:
+        log.error("❌ Falló la publicación del artículo en WordPress.")
+        # No marcar como publicada en caso de fallo transitorio
+        return False
+
 
 def ejecutar_ciclo():
     """Ejecuta un ciclo completo con las secciones: News, Transfers y Football Gossip."""
@@ -1137,120 +1444,19 @@ def ejecutar_ciclo():
             if publicados_seccion >= sec["limit"]:
                 break
                 
-            if ya_fue_publicada(noticia["url"], publicadas):
+            if ya_fue_publicada(noticia["url"], noticia["titulo"], publicadas, sec["name"]):
                 continue
 
-            log.info(f"📰 [{sec['name'].upper()}] [{idx+1}/{total_noticias}] Noticia seleccionada: {noticia['titulo']}")
-            log.info(f"   URL: {noticia['url']}")
-
-            # Extraer entidad (jugador y equipo)
-            jugador, equipo = extraer_entidades(noticia["titulo"], noticia["resumen"])
-            if jugador:
-                log.info(f"   Entidades detectadas: Jugador={jugador}, Equipo={equipo}")
-                # Verificar Cooldown
-                if verificar_cooldown(jugador, sec["name"]):
-                    log.warning(f"   ⚠️ Jugador '{jugador}' está en cooldown para la sección '{sec['name']}'. Saltando.")
-                    marcar_como_publicada(noticia["url"], publicadas)
-                    continue
+            log.info(f"📰 [{sec['name'].upper()}] [{idx+1}/{total_noticias}] Procesando noticia: {noticia['titulo']}")
             
-            # Clasificar fuente (Tier)
-            tier = fuente_tier(noticia["url"])
-            log.info(f"   Clasificación de confianza de la fuente: {tier}")
-
-            # Investigación adicional
-            datos_investigacion = ""
-            if sec["name"] == "transfers" and jugador:
-                results = buscar_web(f"{jugador} market value salary transfer fee history", num_results=3)
-                datos_investigacion = "\n".join([f"- Title: {r['title']}\n  Snippet: {r['snippet']}\n  URL: {r['url']}" for r in results])
-            elif sec["name"] == "gossip" and jugador:
-                # Buscar rumores y cotilleo
-                results_g = buscar_web(f"{jugador} gossip private lifestyle purchases", num_results=3)
-                # Buscar respuesta oficial del jugador
-                results_resp = buscar_web(f"{jugador} official statement responds denies", num_results=2)
-                
-                datos_investigacion = "Gossip & Fan Reaction:\n"
-                datos_investigacion += "\n".join([f"- Title: {r['title']}\n  Snippet: {r['snippet']}" for r in results_g])
-                if results_resp:
-                    datos_investigacion += "\n\nOfficial Responses/Denials:\n"
-                    datos_investigacion += "\n".join([f"- Title: {r['title']}\n  Snippet: {r['snippet']}" for r in results_resp])
-
-            # Redactar artículo
-            try:
-                titulo_es, contenido, _, query_imagen = redactar_articulo(
-                    titulo=noticia["titulo"],
-                    resumen=noticia["resumen"],
-                    fuente=noticia["fuente"],
-                    seccion=sec["name"],
-                    datos_investigacion=datos_investigacion,
-                    tier=tier
-                )
-            except Exception as e:
-                log.error(f"Error en redacción: {e}")
-                marcar_como_publicada(noticia["url"], publicadas)
-                continue
-
-            # Generar imagen
-            media_id = None
-            credits = None
-            img_res = generar_imagen_portada(titulo_es, query_imagen, equipo)
-            if img_res:
-                img_path, credits = img_res
-                if img_path and Path(img_path).exists():
-                    media_id = subir_imagen_a_wordpress(img_path, titulo_es)
-                    try:
-                        Path(img_path).unlink()
-                    except Exception:
-                        pass
-
-            # Créditos del fotógrafo
-            if credits:
-                contenido += f'\n\n<p style="font-size: 11px; color: #777777; font-style: italic; text-align: right; margin-top: 20px;">{credits}</p>'
-
-            # Crear tags de jugador y equipo
-            tags_ids = []
-            if jugador:
-                id_tag_jugador = obtener_o_crear_tag(jugador)
-                if id_tag_jugador:
-                    tags_ids.append(id_tag_jugador)
-            if equipo:
-                id_tag_equipo = obtener_o_crear_tag(equipo)
-                if id_tag_equipo:
-                    tags_ids.append(id_tag_equipo)
-
-            # Publicar en WordPress
-            resultado = publicar_en_wordpress(
-                titulo=titulo_es,
-                contenido=contenido,
-                media_id=media_id,
-                categorias=sec["categories"],
-                tags=tags_ids if tags_ids else None
-            )
-
-            if resultado:
-                marcar_como_publicada(noticia["url"], publicadas)
+            exito = procesar_noticia(noticia, sec, publicadas)
+            if exito:
                 publicados_seccion += 1
                 articulos_publicados_en_ciclo += 1
-                if jugador:
-                    registrar_cooldown(jugador, sec["name"])
-                log.info(f"✅ [{sec['name'].upper()}] [{publicados_seccion}/{sec['limit']}] Publicado: {resultado.get('link')}")
                 
-                # Filtro de palabras sensibles (Gossip) y Telegram Alerta
-                if sec["name"] == "gossip":
-                    PALABRAS_SENSIBLES = [
-                        "affair", "divorce", "arrested", "assault", "lawsuit", "sued",
-                        "cheating", "scandal", "drugs", "doping", "racism", "abuse",
-                        "court", "prison", "domestic", "victim", "sexual"
-                    ]
-                    palabras_detectadas = [w for w in PALABRAS_SENSIBLES if w in contenido.lower() or w in titulo_es.lower()]
-                    if palabras_detectadas:
-                        log.warning(f"⚠️ Palabras de riesgo detectadas: {palabras_detectadas}. Enviando alerta por Telegram...")
-                        enviar_alerta_telegram(titulo_es, resultado.get("link"), palabras_detectadas)
-            else:
-                log.error("❌ Falló la publicación del artículo.")
-                marcar_como_publicada(noticia["url"], publicadas)
-
-            # Pausa de 150 segundos entre artículos para emular flujo humano
-            time.sleep(150)
+                # Pausa de 150 segundos entre artículos para emular flujo humano
+                log.info("Esperando 150 segundos antes del próximo artículo para emular comportamiento humano...")
+                time.sleep(150)
 
     log.info(f"🏁 FIN DE CICLO MULTI-SECCIÓN — Artículos publicados: {articulos_publicados_en_ciclo}")
     log.info("=" * 60)
@@ -1262,7 +1468,6 @@ def ejecutar_ciclo():
 
 if __name__ == "__main__":
     log.info("Bot Futbol Sportivonix arrancando en modo bucle continuo...")
-    # Importar CICLO_HORAS localmente por si acaso
     try:
         from config import CICLO_HORAS
     except ImportError:
@@ -1271,8 +1476,8 @@ if __name__ == "__main__":
     while True:
         try:
             ejecutar_ciclo()
-        except Exception as e:
-            log.error(f"Error inesperado durante la ejecución del ciclo: {e}")
+        except Exception:
+            log.exception("Error inesperado durante la ejecución del ciclo")
         
         segundos_espera = CICLO_HORAS * 3600
         log.info(f"Esperando {CICLO_HORAS} hora(s) ({segundos_espera} segundos) antes de iniciar el próximo ciclo de noticias...")
