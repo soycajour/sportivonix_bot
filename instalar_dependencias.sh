@@ -36,3 +36,4 @@ echo "   python3 \"$SCRIPT_DIR/bot_futbol.py\""
 echo ""
 echo "📋 Para ver el log en tiempo real:"
 echo "   tail -f \"$SCRIPT_DIR/bot_futbol.log\""
+
