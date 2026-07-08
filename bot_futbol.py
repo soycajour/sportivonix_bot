@@ -21,6 +21,7 @@ import unicodedata
 import html
 import mimetypes
 import random
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -562,13 +563,31 @@ def construir_prompt(titulo: str, resumen: str, fuente: str, seccion: str = "new
     min_w = MIN_PALABRAS_GOSSIP if seccion == "gossip" else MIN_PALABRAS
     max_w = MAX_PALABRAS_GOSSIP if seccion == "gossip" else MAX_PALABRAS
     
-    # 1. Definición del rol del periodista según sección
+    # 1. Definición del rol del periodista según sección (NNGroup Tone Profile)
     if seccion == "gossip":
-        persona = """You are a sassy, sharp, and highly opinionated football lifestyle and gossip columnist. You write the "Football Gossip" column for Sportivonix. You speak to the reader like you are sharing juicy secrets and banter with a close mate at a local pub — informal, witty, free-spirited, and engaging."""
+        persona = """You are a sassy, sharp, and highly opinionated football lifestyle and gossip columnist. You write the "Football Gossip" column for Sportivonix.
+TONE PROFILE (Nielsen Norman Group):
+- Formal vs. Casual: Casual (0.9/1.0)
+- Serious vs. Funny: Funny (0.7/1.0)
+- Respectful vs. Irreverent: Irreverent (0.8/1.0)
+- Matter-of-fact vs. Enthusiastic: Enthusiastic (0.8/1.0)
+You speak to the reader like you are sharing juicy secrets and banter with a close mate at a local pub — informal, witty, free-spirited, and engaging."""
     elif seccion == "transfers":
-        persona = """You are an experienced football financial analyst and transfer specialist. You write the "Transfers & Finance" column for Sportivonix. You know player values, salaries, and contract details inside out. You speak in a highly informed, analytical yet conversational tone — opinionated, direct, and focused on whether a deal makes financial and sport sense."""
+        persona = """You are an experienced football financial analyst and transfer specialist. You write the "Transfers & Finance" column for Sportivonix.
+TONE PROFILE (Nielsen Norman Group):
+- Formal vs. Casual: Formal (0.8/1.0)
+- Serious vs. Funny: Serious (0.9/1.0)
+- Respectful vs. Irreverent: Respectful (0.7/1.0)
+- Matter-of-fact vs. Enthusiastic: Matter-of-fact (1.0/1.0)
+You know player values, salaries, and contract details inside out. You speak in a highly informed, analytical yet conversational tone — opinionated, direct, and focused on whether a deal makes financial and sport sense."""
     else:
-        persona = """You are a veteran football journalist who has covered the sport for 20 years across England, Spain, and Italy. You write a column for Sportivonix. You have strong opinions, you know the game inside out, and you write the way you talk after a match at the pub with fellow journalists — direct, colorful, and full of real insight."""
+        persona = """You are a veteran football journalist who has covered the sport for 20 years across England, Spain, and Italy. You write a column for Sportivonix.
+TONE PROFILE (Nielsen Norman Group):
+- Formal vs. Casual: Semi-formal (0.6/1.0)
+- Serious vs. Funny: Serious (0.8/1.0)
+- Respectful vs. Irreverent: Respectful (0.8/1.0)
+- Matter-of-fact vs. Enthusiastic: Matter-of-fact (0.9/1.0)
+You have strong opinions, you know the game inside out, and you write the way you talk after a match at the pub with fellow journalists — direct, colorful, and full of real insight."""
 
     # 2. Instrucciones de fuentes y atribución (Tiers)
     instrucciones_tier = ""
@@ -588,30 +607,37 @@ ADDITIONAL WEB RESEARCH RESULTS (integrate these facts into your column to add d
 {datos_investigacion}
 """
 
-    # 4. Reglas específicas por sección
-    reglas_comunes = f"""WRITING RULES:
-1. LANGUAGE: Write entirely in English. Translate any source material from Spanish/other languages.
-2. LENGTH: {min_w}-{max_w} words.
-3. NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion", "having watched"). Write in analytical, objective third person.
-4. TEMPORAL CONSISTENCY: All dates must align with the current year (2026). E.g. treat the 2026 World Cup as the upcoming or current major tournament. Avoid past references like 2024.
-"""
+    # 4. Reglas específicas por sección (dinámicas y sin colisión de numeración)
+    reglas = [
+        "LANGUAGE: Write entirely in English. Translate any source material from Spanish/other languages.",
+        f"LENGTH: {min_w}-{max_w} words.",
+        'NO FIRST PERSON: Absolutely no first-person pronouns ("I", "we", "my", "our", "in my opinion", "having watched"). Write in analytical, objective third person.',
+        "TEMPORAL CONSISTENCY: All dates must align with the current year (2026). E.g. treat the 2026 World Cup as the upcoming or current major tournament. Avoid past references like 2024.",
+        "ANSWER-FIRST: In the first paragraph, answer the Who, What, When, and Where questions directly and clearly. Do not use vague or slow intros.",
+        "CITATION CAPSULE: Include at least one paragraph containing a high density of key stats, figures, names, and concrete facts (120-180 words) structured clearly for AI search citation extraction."
+    ]
     if instrucciones_tier:
-        reglas_comunes += f"5. SOURCE HANDLING: {instrucciones_tier}\n"
+        reglas.append(f"SOURCE HANDLING: {instrucciones_tier}")
 
     if seccion == "gossip":
-        reglas_especificas = reglas_comunes + f"""6. OPENING: Start with a striking, dramatic, or scandalous hook about the player's life or choices. E.g. 'Neymar has once again proven that money cannot buy discretion.'
-7. STYLE: Free-style, opinionated, and gossipy. Discuss salaries, purchases, relationships, or fan sentiment, but always include the official response/denial if present in the research.
-8. CROSS-LINKING: Near the end, include exactly one paragraph referring to the player's professional performance, linking to their tag (e.g. '<p><em>Curious about his actual performance on the pitch? Check out our <a href="/tag/[player-name-slug]/">Transfers analysis</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name).
-"""
+        reglas.extend([
+            "OPENING: Start with a striking, dramatic, or scandalous hook about the player's life or choices. E.g. 'Neymar has once again proven that money cannot buy discretion.'",
+            "STYLE: Free-style, opinionated, and gossipy. Discuss salaries, purchases, relationships, or fan sentiment, but always include the official response/denial if present in the research.",
+            "CROSS-LINKING: Near the end, include exactly one paragraph referring to the player's professional performance, linking to their tag (e.g. '<p><em>Curious about his actual performance on the pitch? Check out our <a href=\"/tag/[player-name-slug]/\">Transfers analysis</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name)."
+        ])
     elif seccion == "transfers":
-        reglas_especificas = reglas_comunes + f"""6. OPENING: Start with the most dramatic financial figure or contract length. E.g. 'Eintracht Frankfurt have pulled off one of the cleanest robbery jobs in Bundesliga history.'
-7. STYLE: Conversational but heavily analytical on finances. Discuss player values, wages, and whether the club overpaid.
-8. CROSS-LINKING: Near the end, include exactly one paragraph referring to their life off the pitch, linking to their tag (e.g. '<p><em>Want to know more about his life off the pitch? Read our <a href="/tag/[player-name-slug]/">Football Gossip section</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name).
-"""
+        reglas.extend([
+            "OPENING: Start with the most dramatic financial figure or contract length. E.g. 'Eintracht Frankfurt have pulled off one of the cleanest robbery jobs in Bundesliga history.'",
+            "STYLE: Conversational but heavily analytical on finances. Discuss player values, wages, and whether the club overpaid.",
+            "CROSS-LINKING: Near the end, include exactly one paragraph referring to their life off the pitch, linking to their tag (e.g. '<p><em>Want to know more about his life off the pitch? Read our <a href=\"/tag/[player-name-slug]/\">Football Gossip section</a>.</em></p>' substituting [player-name-slug] with the actual lowercased hyphenated player name)."
+        ])
     else:
-        reglas_especificas = reglas_comunes + """6. OPENING: Start with the single most dramatic fact, stat, or consequence. Drop the reader into the middle of the action.
-7. STYLE: Standard columns, news, and controversy.
-"""
+        reglas.extend([
+            "OPENING: Start with the single most dramatic fact, stat, or consequence. Drop the reader into the middle of the action.",
+            "STYLE: Standard columns, news, and controversy."
+        ])
+
+    reglas_especificas = "WRITING RULES:\n" + "\n".join(f"{i+1}. {r}" for i, r in enumerate(reglas))
 
     # 5. Categorías a sugerir
     if seccion == "gossip":
@@ -659,7 +685,39 @@ A specific, opinionated title that a fan would click on (NOT a generic announcem
 
 [SEARCH_QUERY]
 Provide a simple 2-3 word search query in English representing the main subject of this story (e.g., "Jules Kounde", "Real Madrid", "Harry Kane", "Champions League").
+
+[FOCUS_KEYWORD]
+Provide a 2-4 word focus keyphrase for SEO optimization (e.g. "Jules Kounde contract", "Real Madrid new signing").
+
+[META_DESCRIPTION]
+Provide a compelling meta description (120-160 characters) containing the focus keyphrase.
 """
+
+
+def limpiar_marcas_agua_unicode(text: str) -> str:
+    """Elimina marcas de agua invisibles y caracteres de control de formato de IA (Cf)."""
+    # Caracteres de marca de agua invisibles y de control comunes
+    WATERMARK_CHARS = [
+        '\u200B', '\uFEFF', '\u200C', '\u200D', '\u2060', 
+        '\u00AD', '\u202F', '\u2062', '\u2063', '\u2064', 
+        '\u180E', '\u200E', '\u200F', '\u2028', '\u2029'
+    ]
+    for char in WATERMARK_CHARS:
+        text = text.replace(char, '')
+        
+    # Eliminar otros caracteres de la categoría Cf (format control)
+    cleaned = []
+    for char in text:
+        if unicodedata.category(char) != 'Cf':
+            cleaned.append(char)
+    text = ''.join(cleaned)
+    
+    # Limpiar guiones largos (em-dashes) convirtiéndolos en comas o guiones simples
+    # para un estilo de redacción más limpio y periodístico
+    text = text.replace('—', ', ')
+    text = re.sub(r'\s+,', ',', text)
+    text = re.sub(r'  +', ' ', text)
+    return text
 
 
 def limpiar_texto_ia(texto_html: str, titulo: str, resumen: str, fuente: str) -> str:
@@ -737,20 +795,110 @@ DRAFT TO CLEAN:
             # Validación básica: el texto limpio debe tener al menos 60% del largo original
             if len(cleaned) > len(texto_html) * 0.6 and "<p>" in cleaned:
                 log.info(f"✅ Limpieza anti-IA completada con {name}")
-                return cleaned
+                return limpiar_marcas_agua_unicode(cleaned)
             else:
                 log.warning(f"Limpieza devolvió texto demasiado corto o sin HTML. Usando original.")
-                return texto_html
+                return limpiar_marcas_agua_unicode(texto_html)
 
         except Exception:
             log.exception(f"Error en limpieza con {name}")
             continue
 
     log.warning("No se pudo ejecutar la limpieza anti-IA. Usando texto original.")
-    return texto_html
+    return limpiar_marcas_agua_unicode(texto_html)
 
 
-def redactar_articulo(titulo: str, resumen: str, fuente: str, seccion: str = "news", datos_investigacion: str = "", tier: str = "") -> tuple[str, str, list[int], str]:
+def evaluar_borrador(titulo: str, contenido: str, seccion: str) -> tuple[int, list[str]]:
+    """
+    Evalúa un borrador de artículo según una rúbrica de 100 puntos y devuelve la puntuación y feedback detallado.
+    """
+    feedback = []
+    score = 100
+    
+    if "[BODY]" not in contenido:
+        score -= 40
+        feedback.append("Falta la etiqueta obligatoria [BODY] para separar la estructura del artículo.")
+        return score, feedback
+        
+    parts = contenido.split("[BODY]")
+    body_part = parts[1].strip()
+    
+    # 1. Validación de Formato y Estructura (Etiquetas HTML y Markdown)
+    if "```" in body_part:
+        score -= 20
+        feedback.append("Contiene bloques de código Markdown (```). El artículo debe ser puramente HTML.")
+    
+    # Comprobar si hay negritas de markdown (**word**)
+    if "**" in body_part:
+        score -= 10
+        feedback.append("Contiene negritas en formato Markdown (**). Debe usarse la etiqueta HTML <strong>.")
+        
+    # Validar balance de etiquetas HTML básicas
+    for tag in ["<p>", "<h2>", "<strong>", "<a>"]:
+        close_tag = tag.replace("<", "</")
+        if body_part.count(tag) != body_part.count(close_tag):
+            score -= 15
+            feedback.append(f"Etiquetas HTML desbalanceadas para {tag}. Asegúrate de abrir y cerrar correctamente.")
+
+    # 2. Análisis de "AI Slop" y vocabulario redundante
+    SLOP_CLICHES = [
+        "delve", "testament to", "pave the way", "beacon of", "tapestry", 
+        "in a world where", "furthermore", "moreover", "in conclusion", "it is worth noting"
+    ]
+    slop_encontrados = []
+    for phrase in SLOP_CLICHES:
+        if phrase in body_part.lower():
+            slop_encontrados.append(phrase)
+            
+    if slop_encontrados:
+        penalty = min(25, len(slop_encontrados) * 8)
+        score -= penalty
+        feedback.append(f"Uso de clichés típicos de IA (AI-Slop): {', '.join(slop_encontrados)}. Reescribe con un tono más natural y periodístico.")
+
+    # 3. Type-Token Ratio (TTR) - Diversidad de vocabulario
+    palabras = re.findall(r'\b[a-zA-Z]{3,}\b', body_part.lower())
+    if palabras:
+        palabras_unicas = set(palabras)
+        ttr = len(palabras_unicas) / len(palabras)
+        if ttr < 0.45:
+            score -= 15
+            feedback.append(f"Type-Token Ratio bajo ({ttr:.2f}). El vocabulario es muy repetitivo. Usa sinónimos y varía la estructura.")
+    else:
+        ttr = 0.0
+
+    # 4. Burstiness (Variabilidad de la longitud de las oraciones)
+    # Dividir párrafos y calcular desviación estándar de palabras por oración
+    parrafos = [p for p in re.findall(r'<p>(.*?)</p>', body_part, re.DOTALL) if p.strip()]
+    longitudes_oraciones = []
+    for p in parrafos:
+        p_limpio = re.sub(r'<[^>]+>', '', p)
+        # Separar por signos de puntuación de fin de oración, pero no si van seguidos de un dígito (como 42.5)
+        oraciones = [o.strip() for o in re.split(r'[.!?]+(?!\d)', p_limpio) if o.strip()]
+        for o in oraciones:
+            palabras_o = o.split()
+            if palabras_o:
+                longitudes_oraciones.append(len(palabras_o))
+                
+    if len(longitudes_oraciones) > 2:
+        mean = sum(longitudes_oraciones) / len(longitudes_oraciones)
+        variance = sum((x - mean) ** 2 for x in longitudes_oraciones) / len(longitudes_oraciones)
+        std_dev = math.sqrt(variance)
+        if std_dev < 4.0:
+            score -= 15
+            feedback.append(f"Poca variabilidad en la longitud de las oraciones (Desviación estándar: {std_dev:.2f} palabras). Reescribe mezclando oraciones cortas e impactantes con oraciones más explicativas y largas.")
+
+    # 5. Citabilidad y E-E-A-T (Cifras y Datos concretos)
+    numeros = re.findall(r'\b\d+[\d,.]*\b', body_part)
+    datos_reales = [n for n in numeros if n not in ["2026", "2025", "2024"]]
+    if not datos_reales:
+        score -= 10
+        feedback.append("El artículo carece de cifras, datos monetarios, estadísticas o números clave de soporte que añadan credibilidad (E-E-A-T).")
+
+    score = max(0, score)
+    return score, feedback
+
+
+def redactar_articulo(titulo: str, resumen: str, fuente: str, seccion: str = "news", datos_investigacion: str = "", tier: str = "") -> tuple[str, str, list[int], str, str | None, str | None]:
     """Prueba múltiples proveedores LLM (Groq, Cerebras, OpenRouter, Gemini) hasta que uno funcione."""
     prompt = construir_prompt(titulo, resumen, fuente, seccion, datos_investigacion, tier)
     
@@ -811,9 +959,60 @@ def redactar_articulo(titulo: str, resumen: str, fuente: str, seccion: str = "ne
                         
                     resp.raise_for_status()
                     raw_text = resp.json()["choices"][0]["message"]["content"].strip()
-                else:
-                    break # Tipo no soportado
+                # Bucle de reintentos por rúbrica de calidad
+                borrador_actual = raw_text
+                for iteracion_refine in range(2):
+                    score, feedback_list = evaluar_borrador(titulo, borrador_actual, seccion)
+                    if score >= 90:
+                        log.info(f"✨ Borrador aprobado con puntuación {score}/100.")
+                        raw_text = borrador_actual
+                        break
                     
+                    log.warning(f"⚠️ El borrador no superó la rúbrica ({score}/100) en {name}. Feedback: {feedback_list}. Solicitando corrección...")
+                    
+                    prompt_refinamiento = f"""
+You are a senior sports editor. Review and rewrite the previous article draft to correct the following quality issues:
+{chr(10).join(f'- {f}' for f in feedback_list)}
+
+PREVIOUS DRAFT:
+{borrador_actual}
+
+RULES:
+- Maintain the exact same format tags ([TITLE], [BODY], [CATEGORIES], [SEARCH_QUERY]).
+- Do NOT include any meta-text, introductions, or pleasantries. Output only the formatted corrections.
+"""
+                    try:
+                        if ptype == "gemini":
+                            payload = {
+                                "contents": [
+                                    {"role": "user", "parts": [{"text": prompt}]},
+                                    {"role": "model", "parts": [{"text": borrador_actual}]},
+                                    {"role": "user", "parts": [{"text": prompt_refinamiento}]}
+                                ],
+                                "generationConfig": {"temperature": 0.5, "topP": 0.95, "maxOutputTokens": 1500}
+                            }
+                            resp_ref = requests.post(gemini_url, json=payload, timeout=60)
+                            if resp_ref.status_code == 200:
+                                borrador_actual = resp_ref.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        elif ptype == "openai_compatible":
+                            payload = {
+                                "model": model,
+                                "messages": [
+                                    {"role": "user", "content": prompt},
+                                    {"role": "assistant", "content": borrador_actual},
+                                    {"role": "user", "content": prompt_refinamiento}
+                                ],
+                                "temperature": 0.5,
+                            }
+                            resp_ref = requests.post(url, json=payload, headers=headers, timeout=60)
+                            if resp_ref.status_code == 200:
+                                borrador_actual = resp_ref.json()["choices"][0]["message"]["content"].strip()
+                    except Exception as e:
+                        log.warning(f"Error durante reintento de refinamiento: {e}")
+                        break
+                else:
+                    raw_text = borrador_actual
+
                 # Parsear respuesta usando las etiquetas [TITLE], [BODY], [CATEGORIES] y [SEARCH_QUERY]
                 if "[BODY]" in raw_text:
                     parts = raw_text.split("[BODY]")
@@ -823,6 +1022,26 @@ def redactar_articulo(titulo: str, resumen: str, fuente: str, seccion: str = "ne
                     title_part = title_part.strip('\'" ')
                     body_part = parts[1].strip()
                     
+                    # Extraer META_DESCRIPTION
+                    meta_desc = None
+                    match_md = re.search(r'\**\[META_DESCRIPTION\]\**:?.*', body_part, re.IGNORECASE | re.DOTALL)
+                    if match_md:
+                        md_str = match_md.group(0)
+                        body_part = body_part[:match_md.start()].strip()
+                        md_lines = [l.strip() for l in md_str.replace("[META_DESCRIPTION]", "").replace(":", "").split("\n") if l.strip()]
+                        if md_lines:
+                            meta_desc = md_lines[0].replace("*", "").strip()
+
+                    # Extraer FOCUS_KEYWORD
+                    focus_kw = None
+                    match_fkw = re.search(r'\**\[FOCUS_KEYWORD\]\**:?.*', body_part, re.IGNORECASE | re.DOTALL)
+                    if match_fkw:
+                        fkw_str = match_fkw.group(0)
+                        body_part = body_part[:match_fkw.start()].strip()
+                        fkw_lines = [l.strip() for l in fkw_str.replace("[FOCUS_KEYWORD]", "").replace(":", "").split("\n") if l.strip()]
+                        if fkw_lines:
+                            focus_kw = fkw_lines[0].replace("*", "").strip()
+
                     # Extraer SEARCH_QUERY
                     search_query = "football match"
                     match_sq = re.search(r'\**\[SEARCH_QUERY\]\**:?.*', body_part, re.IGNORECASE | re.DOTALL)
@@ -853,10 +1072,10 @@ def redactar_articulo(titulo: str, resumen: str, fuente: str, seccion: str = "ne
                     # Limpiar las posibles etiquetas markdown (```html o ```)
                     body_part = re.sub(r"^```(?:html|markdown|text)?\n?", "", body_part, flags=re.IGNORECASE)
                     body_part = re.sub(r"\n?```$", "", body_part)
-                    log.info(f"✅ Artículo redactado exitosamente con {name}: {len(body_part.split())} palabras aprox. Categorías: {categorias_list}. Query imagen: {search_query}")
+                    log.info(f"✅ Artículo redactado exitosamente con {name}: {len(body_part.split())} palabras aprox. Categorías: {categorias_list}. Query imagen: {search_query}. Focus KW: {focus_kw}. Meta Desc: {meta_desc}")
                     # Segunda pasada: limpiar AI-isms
                     body_part = limpiar_texto_ia(body_part, titulo, resumen, fuente)
-                    return title_part, body_part, categorias_list, search_query
+                    return title_part, body_part, categorias_list, search_query, focus_kw, meta_desc
                 else:
                     lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
                     if len(lines) > 1:
@@ -866,7 +1085,7 @@ def redactar_articulo(titulo: str, resumen: str, fuente: str, seccion: str = "ne
                             default_cats = [CAT_GOSSIP]
                         else:
                             default_cats = [CAT_NEWS]
-                        return lines[0], "\n".join(lines[1:]), default_cats, "football match"
+                        return lines[0], "\n".join(lines[1:]), default_cats, "football match", None, None
                     raise ValueError("Respuesta mal formateada sin [TITLE] y [BODY]")
                     
             except Exception as e:
@@ -1107,81 +1326,13 @@ def generar_imagen_portada(titulo: str, search_query: str = "football match", eq
         elif not query_final or any(w in query_final for w in ["contract", "deal", "transfer", "gossip", "money", "signing", "football match"]):
             query_final = "soccer player pitch"
 
-    # 0. Intentar generar la imagen usando Cloudflare Workers AI (FLUX) primero
+    # 0. Intentar generar la imagen usando Cloudflare Workers AI (FLUX) únicamente
     ai_img = generar_imagen_cloudflare_ai(titulo, query_final)
     if ai_img:
         return ai_img, "Generated by Cloudflare Workers AI (FLUX.1 [schnell])"
 
-    # 1. Intentar Wikimedia Commons si la generación por IA falló
-    wiki_res = buscar_imagen_wikimedia(query_final)
-    if wiki_res:
-        log.info("✅ Usando imagen de Wikimedia Commons.")
-        return wiki_res
-
-    # 2. Respaldo a Pexels / Pixabay
-    log.info("⚠️ No se encontró imagen en Wikimedia. Usando imágenes de stock...")
-    img_path = DIR_IMG_PATH / f"portada_{int(time.time())}_{random.randint(100, 999)}.jpg"
-    
-    pexels_key = "" 
-    pixabay_key = ""
-    try:
-        from config import PEXELS_API_KEY, PIXABAY_API_KEY
-        pexels_key = PEXELS_API_KEY
-        pixabay_key = PIXABAY_API_KEY
-    except ImportError:
-        pass
-    
-    img_url = None
-
-    # 1. Intentar Pexels
-    try:
-        if pexels_key and pexels_key != "TU_CLAVE_AQUI":
-            log.info(f"Buscando imagen en Pexels para: {query_final}")
-            url = f"https://api.pexels.com/v1/search?query={query_final}&per_page=15&orientation=landscape"
-            headers = {"Authorization": pexels_key}
-            req = requests.get(url, headers=headers, timeout=15)
-            if req.status_code == 200:
-                photos = req.json().get('photos', [])
-                if photos:
-                    img_url = random.choice(photos)['src']['large2x']
-    except Exception:
-        log.exception("Error con Pexels")
-
-    # 2. Intentar Pixabay si Pexels falló
-    if not img_url:
-        try:
-            if pixabay_key and pixabay_key != "TU_CLAVE_AQUI":
-                log.info(f"Buscando imagen en Pixabay para: {query_final}")
-                query_pix = query_final.replace(" ", "+")
-                url = f"https://pixabay.com/api/?key={pixabay_key}&q={query_pix}&image_type=photo&orientation=horizontal&per_page=15"
-                req = requests.get(url, timeout=15)
-                if req.status_code == 200:
-                    hits = req.json().get('hits', [])
-                    if hits:
-                        img_url = random.choice(hits)['largeImageURL']
-        except Exception:
-            log.exception("Error con Pixabay")
-
-    # 3. Imagen genérica si ambos fallaron
-    if not img_url:
-        log.warning("No se pudo obtener imagen de Pexels ni Pixabay. Usando genérica.")
-        img_url = "https://images.pexels.com/photos/114296/pexels-photo-114296.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1"
-        
-    # Descargar
-    try:
-        log.info("Descargando imagen fotográfica...")
-        resp_stock = requests.get(img_url, timeout=30)
-        if resp_stock.status_code == 200 and resp_stock.headers.get("Content-Type", "").startswith("image/"):
-            with open(img_path, 'wb') as f:
-                f.write(resp_stock.content)
-            log.info(f"Imagen descargada con éxito: {img_path}")
-            return str(img_path), None
-        else:
-            log.warning(f"Error descargando imagen de stock: HTTP {resp_stock.status_code}")
-            return None
-    except Exception:
-        log.exception("Error final al descargar la imagen")
-        return None
+    log.warning("⚠️ Falló la generación de imagen con IA y se han deshabilitado los fallbacks de stock/Wikimedia. El artículo no tendrá imagen de portada.")
+    return None
 
 
 # =============================================================================
@@ -1234,16 +1385,45 @@ def generar_excerpt(contenido_html: str) -> str:
     return texto[:157] + "..." if len(texto) > 157 else texto
 
 
-def publicar_en_wordpress(titulo: str, contenido: str, media_id: int | None, categorias: list[int] = None, tags: list[int] = None) -> dict | None:
+def publicar_en_wordpress(titulo: str, contenido: str, media_id: int | None, categorias: list[int] = None, tags: list[int] = None, focus_keyword: str | None = None, meta_description: str | None = None) -> dict | None:
     """Publica el artículo en WordPress. Devuelve la respuesta JSON o None."""
+    # Generar esquema JSON-LD semántico (NewsArticle) para SEO y Motores de Respuesta
+    schema = {
+        "@context": "https://schema.org",
+        "@type": "NewsArticle",
+        "headline": titulo,
+        "datePublished": datetime.now(timezone.utc).isoformat(),
+        "author": {
+            "@type": "Organization",
+            "name": "Sportivonix",
+            "url": WP_URL
+        },
+        "publisher": {
+            "@type": "Organization",
+            "name": "Sportivonix"
+        },
+        "mainEntityOfPage": f"{WP_URL}/{generar_slug(titulo)}/"
+    }
+    schema_script = f'\n\n<script type="application/ld+json">\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n</script>'
+
     payload = {
         "title": titulo,
-        "content": contenido,
+        "content": contenido + schema_script,
         "status": WP_POST_STATUS,
         "slug": generar_slug(titulo),
         "excerpt": generar_excerpt(contenido),
         "format": "standard",
     }
+    
+    # Soporte nativo para Yoast SEO via REST API
+    meta_fields = {}
+    if focus_keyword:
+        meta_fields["_yoast_wpseo_focuskw"] = focus_keyword
+    if meta_description:
+        meta_fields["_yoast_wpseo_metadesc"] = meta_description
+    if meta_fields:
+        payload["meta"] = meta_fields
+
     if media_id:
         payload["featured_media"] = media_id
         
@@ -1277,6 +1457,90 @@ def publicar_en_wordpress(titulo: str, contenido: str, media_id: int | None, cat
 # =============================================================================
 # 6. CICLO PRINCIPAL
 # =============================================================================
+
+def traducir_a_ingles(titulo: str, contenido: str, focus_kw: str | None = None, meta_desc: str | None = None) -> tuple[str, str, str | None, str | None]:
+    """Traduce el título, contenido, palabra clave y meta descripción a inglés usando el LLM."""
+    log.info("🌐 Traduciendo artículo final a inglés para garantizar coherencia...")
+    
+    datos = {
+        "title": titulo,
+        "content": contenido,
+        "focus_keyword": focus_kw or "",
+        "meta_description": meta_desc or ""
+    }
+    
+    prompt_traducir = f"""You are a professional sports translator and editor. Translate the following JSON object fields into natural, native, high-quality sports English.
+Keep all HTML tags (<p>, <h2>, <strong>, etc.) exactly as they are in the content field.
+Do not change player names, transfer figures, or facts.
+Return ONLY the translated JSON object with the exact same keys ("title", "content", "focus_keyword", "meta_description"). Do not include markdown code block formatting (```json) or any other conversational text.
+
+JSON to translate:
+{json.dumps(datos, ensure_ascii=False)}"""
+
+    try:
+        from config import LLM_PROVIDERS
+    except ImportError:
+        return titulo, contenido, focus_kw, meta_desc
+
+    for provider in LLM_PROVIDERS:
+        name = provider.get("name", "Unknown")
+        ptype = provider.get("type", "")
+        api_key = provider.get("api_key", "")
+        model = provider.get("model", "")
+        url = provider.get("url", "")
+
+        try:
+            log.info(f"Traduciendo con {name}...")
+            if ptype == "gemini":
+                gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+                payload = {
+                    "contents": [{"parts": [{"text": prompt_traducir}]}],
+                    "generationConfig": {"temperature": 0.2, "topP": 0.9, "maxOutputTokens": 2000}
+                }
+                resp = requests.post(gemini_url, json=payload, timeout=60)
+            elif ptype == "openai_compatible":
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt_traducir}],
+                    "temperature": 0.2,
+                }
+                resp = requests.post(url, json=payload, headers=headers, timeout=60)
+            else:
+                continue
+
+            if resp.status_code == 200:
+                if ptype == "gemini":
+                    raw_res = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                else:
+                    raw_res = resp.json()["choices"][0]["message"]["content"].strip()
+                
+                raw_res = re.sub(r"^```(?:json)?\n?", "", raw_res, flags=re.IGNORECASE)
+                raw_res = re.sub(r"\n?```$", "", raw_res)
+                
+                res_json = json.loads(raw_res)
+                t_title = res_json.get("title", titulo).strip()
+                t_content = res_json.get("content", contenido).strip()
+                t_fkw = res_json.get("focus_keyword")
+                t_mdesc = res_json.get("meta_description")
+                
+                t_fkw = t_fkw.strip() if t_fkw else focus_kw
+                t_mdesc = t_mdesc.strip() if t_mdesc else meta_desc
+                
+                if t_title and t_content:
+                    log.info("✅ Traducción completada con éxito.")
+                    return t_title, t_content, t_fkw, t_mdesc
+            
+        except Exception as e:
+            log.warning(f"Error en traducción con {name}: {e}")
+            continue
+            
+    log.warning("No se pudo traducir. Usando originales.")
+    return titulo, contenido, focus_kw, meta_desc
+
 
 def procesar_noticia(noticia: dict, sec: dict, publicadas: dict) -> bool:
     """Procesa una única noticia: extrae entidades, comprueba cooldowns, redacta, genera imagen, publica y alerta.
@@ -1317,7 +1581,7 @@ def procesar_noticia(noticia: dict, sec: dict, publicadas: dict) -> bool:
 
     # Redactar artículo
     try:
-        titulo_final, contenido, categorias_retornadas, query_imagen = redactar_articulo(
+        titulo_final, contenido, categorias_retornadas, query_imagen, focus_kw, meta_desc = redactar_articulo(
             titulo=titulo,
             resumen=resumen,
             fuente=fuente,
@@ -1325,8 +1589,15 @@ def procesar_noticia(noticia: dict, sec: dict, publicadas: dict) -> bool:
             datos_investigacion=datos_investigacion,
             tier=tier
         )
+        # Traducir artículo final a inglés antes de validar o generar la imagen
+        titulo_final, contenido, focus_kw, meta_desc = traducir_a_ingles(
+            titulo=titulo_final,
+            contenido=contenido,
+            focus_kw=focus_kw,
+            meta_desc=meta_desc
+        )
     except Exception:
-        log.exception("Error en redacción del artículo.")
+        log.exception("Error en redacción o traducción del artículo.")
         # No marcamos como publicada si falló la redacción para reintentar con otro proveedor o ciclo
         return False
 
@@ -1372,7 +1643,9 @@ def procesar_noticia(noticia: dict, sec: dict, publicadas: dict) -> bool:
         contenido=contenido,
         media_id=media_id,
         categorias=categorias_usar,
-        tags=tags_ids if tags_ids else None
+        tags=tags_ids if tags_ids else None,
+        focus_keyword=focus_kw,
+        meta_description=meta_desc
     )
 
     if resultado:
