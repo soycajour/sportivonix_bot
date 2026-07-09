@@ -33,6 +33,47 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
 
+# Verificación automática de dependencias al arrancar
+try:
+    import requests
+    import feedparser
+    import duckduckgo_search
+except ImportError as e:
+    print(f"⚠️ Falta una dependencia requerida: {e.name}")
+    print("Intentando ejecutar 'instalar_dependencias.sh' de forma automática...")
+    import subprocess
+    
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instalar_dependencias.sh")
+    if os.path.exists(script_path):
+        try:
+            # Dar permisos de ejecución en sistemas Unix
+            if os.name != "nt":
+                try:
+                    subprocess.run(["chmod", "+x", script_path], check=True)
+                except Exception:
+                    pass
+            
+            # Ejecutar el instalador según el sistema operativo
+            if os.name != "nt":
+                subprocess.run([script_path], check=True)
+            else:
+                try:
+                    subprocess.run(["bash", script_path], check=True)
+                except FileNotFoundError:
+                    print("❌ No se pudo ejecutar el script bash en Windows. Por favor, corre 'pip install feedparser requests duckduckgo-search' manualmente.")
+                    sys.exit(1)
+                    
+            print("✅ Dependencias instaladas con éxito. Reiniciando el bot...")
+            # Recargar y reiniciar el proceso actual de Python
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as err:
+            print(f"❌ Error al ejecutar el script de instalación automática: {err}")
+            sys.exit(1)
+    else:
+        print(f"❌ No se encontró 'instalar_dependencias.sh' en {script_path}. Por favor, instálalo manualmente.")
+        sys.exit(1)
+
+
 # ─── Configuración ───────────────────────────────────────────────────────────
 # Ajustar el path para importar config.py desde el mismo directorio
 SCRIPT_DIR = Path(__file__).parent.resolve()
