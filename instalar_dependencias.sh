@@ -37,3 +37,4 @@ echo ""
 echo "📋 Para ver el log en tiempo real:"
 echo "   tail -f \"$SCRIPT_DIR/bot_futbol.log\""
 
+1
