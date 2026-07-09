@@ -105,3 +105,5 @@ PEXELS_API_KEY = "TU_PEXELS_API_KEY"
 
 # Pixabay API Key
 PIXABAY_API_KEY = "TU_PIXABAY_API_KEY"
+
+#solo para probar que todo salio bien el server

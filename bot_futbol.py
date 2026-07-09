@@ -1796,3 +1796,5 @@ if __name__ == "__main__":
         segundos_espera = CICLO_HORAS * 3600
         log.info(f"Esperando {CICLO_HORAS} hora(s) ({segundos_espera} segundos) antes de iniciar el próximo ciclo de noticias...")
         time.sleep(segundos_espera)
+
+#solo para probar que todo salio bien el server
