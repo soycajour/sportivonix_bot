@@ -1114,7 +1114,8 @@ RULES:
                     body_part = re.sub(r"^```(?:html|markdown|text)?\n?", "", body_part, flags=re.IGNORECASE)
                     body_part = re.sub(r"\n?```$", "", body_part)
                     log.info(f"✅ Artículo redactado exitosamente con {name}: {len(body_part.split())} palabras aprox. Categorías: {categorias_list}. Query imagen: {search_query}. Focus KW: {focus_kw}. Meta Desc: {meta_desc}")
-                    # Segunda pasada: limpiar AI-isms
+                    # Segunda pasada: limpiar AI-isms (esperar 3 segundos para evitar 429)
+                    time.sleep(3)
                     body_part = limpiar_texto_ia(body_part, titulo, resumen, fuente)
                     return title_part, body_part, categorias_list, search_query, focus_kw, meta_desc
                 else:
@@ -1495,6 +1496,41 @@ def publicar_en_wordpress(titulo: str, contenido: str, media_id: int | None, cat
         return None
 
 
+def notificar_indexnow(url_post: str) -> bool:
+    """Envía la URL de la nueva entrada a la API de IndexNow para indexarla de forma inmediata."""
+    try:
+        from config import INDEXNOW_KEY, INDEXNOW_KEY_LOCATION
+    except ImportError:
+        log.warning("No se pudieron cargar las credenciales de IndexNow desde config.py.")
+        return False
+
+    if not INDEXNOW_KEY or INDEXNOW_KEY == "TU_INDEXNOW_KEY":
+        log.info("IndexNow no está configurado (clave vacía o plantilla). Saltando indexación instantánea.")
+        return False
+
+    log.info(f"📤 Enviando solicitud de indexación instantánea (IndexNow) para: {url_post}")
+    endpoint = "https://api.indexnow.org/indexnow"
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    payload = {
+        "host": "sportivonix.com",
+        "key": INDEXNOW_KEY,
+        "keyLocation": INDEXNOW_KEY_LOCATION or f"https://sportivonix.com/{INDEXNOW_KEY}.txt",
+        "urlList": [url_post]
+    }
+
+    try:
+        r = requests.post(endpoint, json=payload, headers=headers, timeout=15)
+        if r.status_code == 200:
+            log.info("✅ Solicitud de indexación enviada con éxito a IndexNow (Bing/Yandex/etc.)")
+            return True
+        else:
+            log.warning(f"⚠️ IndexNow respondió con código {r.status_code}: {r.text[:300]}")
+            return False
+    except Exception as e:
+        log.warning(f"Error de red al enviar indexación instantánea: {e}")
+        return False
+
+
 # =============================================================================
 # 6. CICLO PRINCIPAL
 # =============================================================================
@@ -1630,7 +1666,8 @@ def procesar_noticia(noticia: dict, sec: dict, publicadas: dict) -> bool:
             datos_investigacion=datos_investigacion,
             tier=tier
         )
-        # Traducir artículo final a inglés antes de validar o generar la imagen
+        # Traducir artículo final a inglés (esperar 3 segundos para evitar 429)
+        time.sleep(3)
         titulo_final, contenido, focus_kw, meta_desc = traducir_a_ingles(
             titulo=titulo_final,
             contenido=contenido,
@@ -1693,7 +1730,12 @@ def procesar_noticia(noticia: dict, sec: dict, publicadas: dict) -> bool:
         marcar_como_publicada(url, titulo_final, publicadas, sec["name"])
         if jugador:
             registrar_cooldown(jugador, sec["name"])
-        log.info(f"✅ [{sec['name'].upper()}] Publicado con éxito: {resultado.get('link')}")
+        url_publicada = resultado.get("link")
+        log.info(f"✅ [{sec['name'].upper()}] Publicado con éxito: {url_publicada}")
+        
+        # Enviar a indexar inmediatamente (IndexNow)
+        if url_publicada:
+            notificar_indexnow(url_publicada)
         
         # Filtro de palabras sensibles (con límites de palabra \b para evitar falsos positivos)
         PALABRAS_SENSIBLES = [

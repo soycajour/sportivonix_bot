@@ -106,4 +106,12 @@ PEXELS_API_KEY = "TU_PEXELS_API_KEY"
 # Pixabay API Key
 PIXABAY_API_KEY = "TU_PIXABAY_API_KEY"
 
+# Cloudflare Workers AI credentials
+CLOUDFLARE_ACCOUNT_ID = "TU_CLOUDFLARE_ACCOUNT_ID"
+CLOUDFLARE_API_TOKEN = "TU_CLOUDFLARE_API_TOKEN"
+
+# IndexNow credentials
+INDEXNOW_KEY = "TU_INDEXNOW_KEY"
+INDEXNOW_KEY_LOCATION = "https://tu-sitio.com/TU_INDEXNOW_KEY.txt"
+
 #solo para probar que todo salio bien el server
